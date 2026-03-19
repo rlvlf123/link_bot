@@ -13,19 +13,18 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 STEAM_API_KEY = os.getenv('STEAM_API_KEY')
 GH_TOKEN = os.getenv('GH_TOKEN')    # GitHub Personal Access Token
 GH_REPO = os.getenv('GH_REPO')      # "계정명/리포지토리명"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = 'tracked_users.json'    # 로컬 경로 대신 GitHub 파일 이름으로 사용
+DATA_FILE = os.getenv('DATA_FILE', 'tracked_users.json')
 
 # GitHub API 초기화
-g = Github(GH_TOKEN)
 try:
+    g = Github(GH_TOKEN)
     repo = g.get_repo(GH_REPO)
 except Exception as e:
     print(f"❌ GitHub 리포지토리 연결 실패: {e}")
 
-# --- [2. GitHub 데이터 동기화 함수 추가] ---
+# --- [2. GitHub 데이터 동기화 함수] ---
 def load_data():
-    """GitHub에서 데이터를 불러옵니다. 실패 시 로컬 또는 기본값을 반환합니다."""
+    """GitHub에서 데이터를 불러옵니다. 실패 시 기본값을 반환합니다."""
     default_structure = {'users': {}, 'channels': {}}
     try:
         content = repo.get_contents(DATA_FILE)
@@ -33,7 +32,7 @@ def load_data():
         print("✅ GitHub에서 데이터를 성공적으로 불러왔습니다.")
         return json.loads(decoded_data)
     except Exception as e:
-        print(f"⚠️ GitHub 데이터 로드 실패 (파일이 없을 수 있음): {e}")
+        print(f"⚠️ GitHub 데이터 로드 실패 (새 파일로 시작합니다): {e}")
         return default_structure
 
 def save_data(data, message="Update tracked data"):
@@ -41,17 +40,15 @@ def save_data(data, message="Update tracked data"):
     try:
         new_content = json.dumps(data, indent=4, ensure_ascii=False)
         try:
-            # 기존 파일이 있는지 확인 후 업데이트
             content = repo.get_contents(DATA_FILE)
             repo.update_file(content.path, message, new_content, content.sha)
         except:
-            # 파일이 없으면 새로 생성
             repo.create_file(DATA_FILE, "Initial data create", new_content)
         print(f"✅ GitHub 동기화 완료: {message}")
     except Exception as e:
         print(f"❌ GitHub 저장 실패: {e}")
 
-# 초기 데이터 로드 (실행 시 GitHub에서 가져옴)
+# 초기 데이터 로드
 db = load_data()
 
 # --- [3. 스팀 API 및 유틸리티] ---
@@ -119,17 +116,11 @@ class MyBot(commands.Bot):
         print(f"🤖 봇 이름: {self.user.name} ({self.user.id})")
         print(f"📊 감시 중인 유저 수: {len(db['users'])}명")
         print(f"📢 알림 채널 수: {len(db['channels'])}개")
-        print(f"✅ 모든 슬래시 명령어(/)가 동기화되었습니다.")
         print("="*50 + "\n")
 
     @tasks.loop(minutes=2.0)
     async def check_steam_nicknames(self):
-        now_time = datetime.now().strftime('%H:%M:%S')
-        if not db['users']:
-            print(f"[{now_time}] 실시간 감시 중... (등록된 유저 없음)")
-            return
-            
-        print(f"[{now_time}] 실시간 감시 루프 작동 중: {len(db['users'])}명 체크 시작")
+        if not db['users']: return
         changed = False
         for key, data in list(db['users'].items()):
             sid = data['steam_id']
@@ -143,27 +134,21 @@ class MyBot(commands.Bot):
                 history.append(curr_nick)
                 db['users'][key]['history'] = history
                 changed = True
-                print(f"⚠️  [변경 감지] '{key}' 유저: {history[-2] if len(history)>1 else 'N/A'} -> {curr_nick}")
                 
                 msg = format_history_message(key, sid, history, mode="notify", player_info=player)
                 for gid, ch_id in list(db['channels'].items()):
                     try:
                         channel = self.get_channel(int(ch_id)) or await self.fetch_channel(int(ch_id))
-                        if channel: 
-                            await channel.send(msg)
-                            print(f"   ㄴ 전송 완료: 채널 ID {ch_id}")
-                    except Exception as e:
-                        print(f"   ㄴ 전송 실패 (채널 ID {ch_id}): {e}")
+                        if channel: await channel.send(msg)
+                    except: continue
             await asyncio.sleep(1)
-        if changed: save_data(db, "Auto Update: Nickname change detected") # 닉네임 변경 시 GitHub 자동 저장
+        if changed: save_data(db, "Auto Update: Nickname change detected")
 
 bot = MyBot()
 
 # --- [5. 슬래시 명령어] ---
-
 @bot.tree.command(name="도움말", description="명령어 안내")
 async def help_command(i: discord.Interaction):
-    print(f"📝 [명령어 사용] {i.user}님이 /도움말을 사용했습니다.")
     embed = discord.Embed(title="🎮 스팀 감시 봇 가이드", color=discord.Color.blue())
     embed.add_field(name="📢 `/채널설정`", value="알림 받을 채널로 지정 (관리자용)", inline=False)
     embed.add_field(name="➕ `/추가 [ID] [별명]`", value="유저 등록 (17자리 SteamID)", inline=False)
@@ -176,8 +161,7 @@ async def help_command(i: discord.Interaction):
 @app_commands.checks.has_permissions(administrator=True)
 async def set_channel(i: discord.Interaction):
     db['channels'][str(i.guild_id)] = i.channel_id
-    save_data(db, f"Channel Set: {i.channel.name}") # 채널 설정 시 GitHub 저장
-    print(f"📢 [채널 설정] {i.guild.name} 서버 - {i.channel.name} 채널이 알림지로 등록되었습니다.")
+    save_data(db, f"Channel Set: {i.channel.name}")
     await i.response.send_message(f"📢 **설정 완료!** 이제 이 채널로 알림이 전송됩니다.")
 
 @bot.tree.command(name="추가", description="감시할 스팀 유저 추가")
@@ -192,8 +176,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     if not history or history[-1] != curr_name: history.append(curr_name)
     
     db['users'][key] = {'steam_id': steam_id, 'history': history}
-    save_data(db, f"User Added: {key}") # 유저 추가 시 GitHub 저장
-    print(f"➕ [유저 추가] {i.user}님이 '{key}' 유저를 등록했습니다.")
+    save_data(db, f"User Added: {key}")
     await i.followup.send(format_history_message(key, steam_id, history, mode="add", player_info=player))
 
 @bot.tree.command(name="내역", description="유저 상태 및 기록 조회")
@@ -206,29 +189,28 @@ async def history_command(i: discord.Interaction, target: str):
             break
     if not found_data: return await i.followup.send("❌ 유저를 찾을 수 없습니다.")
     player = await get_steam_user_info(found_data['steam_id'])
-    print(f"🔍 [내역 조회] {i.user}님이 '{found_key}' 유저를 조회했습니다.")
     await i.followup.send(format_history_message(found_key, found_data['steam_id'], found_data['history'], mode="history", player_info=player))
 
 @bot.tree.command(name="현황", description="감시 목록 확인")
 async def status_list(i: discord.Interaction):
-    print(f"📊 [현황 확인] {i.user}님이 감시 목록을 확인했습니다.")
     if not db['users']: return await i.response.send_message("📊 감시 중인 유저가 없습니다.")
     msg = f"📊 **실시간 감시 현황 ({len(db['users'])}명)**\n```text\n"
     for key, data in db['users'].items():
         msg += f"• {key} ({data['steam_id']})\n"
     await i.response.send_message(msg + "```")
 
-@bot.tree.command(name="삭제", description="유저 삭제 (관리자 전용)")
+@bot.tree.command(name="삭제", description="유저 삭제 (관리자용)")
 @app_commands.default_permissions(administrator=True)
 async def delete_user(i: discord.Interaction, target: str):
     if target in db['users']:
         del db['users'][target]
-        save_data(db, f"User Deleted: {target}") # 유저 삭제 시 GitHub 저장
-        print(f"❌ [유저 삭제] {i.user}님이 '{target}' 유저를 삭제했습니다.")
+        save_data(db, f"User Deleted: {target}")
         await i.response.send_message(f"✅ `{target}` 유저를 삭제했습니다.")
     else:
         await i.response.send_message("❌ 찾을 수 없습니다.")
 
 if __name__ == "__main__":
-    if TOKEN: bot.run(TOKEN)
-    else: print("❌ 오류: DIS
+    if TOKEN:
+        bot.run(TOKEN)
+    else:
+        print("❌ 오류: DISCORD_TOKEN 환경 변수가 설정되지 않았습니다.")
