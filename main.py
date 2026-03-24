@@ -46,7 +46,7 @@ db = load_data()
 
 # --- [3. 유틸리티] ---
 async def get_steam_users_info(steam_ids):
-    """여러 ID를 한 번에 조회하여 API 효율성 극대화"""
+    if not steam_ids: return []
     ids_str = ",".join(steam_ids)
     url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={ids_str}"
     try:
@@ -57,9 +57,11 @@ async def get_steam_users_info(steam_ids):
     return []
 
 def create_status_embed(display_name, sid, history, mode="notify", player=None):
-    """텍스트 대신 깔끔한 임베드 메시지 생성"""
     colors = {"add": discord.Color.green(), "notify": discord.Color.gold(), "history": discord.Color.blue()}
     titles = {"add": "✨ 새 감시 대상 추가", "notify": "🔔 닉네임 변경 알림", "history": "📋 유저 정보 조회"}
+    
+    # 별명이 없을 경우 표시 처리
+    display_title = display_name if display_name else "별명없음"
     
     embed = discord.Embed(title=titles.get(mode, "알림"), color=colors.get(mode, discord.Color.light_grey()))
     
@@ -70,18 +72,18 @@ def create_status_embed(display_name, sid, history, mode="notify", player=None):
         if 'gameextrainfo' in player: state = f"🕹️ 플레이 중: {player['gameextrainfo']}"
         embed.add_field(name="현재 상태", value=state, inline=False)
 
-    embed.add_field(name="식별 별명", value=display_name, inline=True)
+    embed.add_field(name="식별 별명", value=display_title, inline=True)
     embed.add_field(name="최신 닉네임", value=history[-1] if history else "없음", inline=True)
-    embed.add_field(name="변경 기록", value=" → ".join(history[-5:]), inline=False) # 최근 5개만 표시
+    embed.add_field(name="변경 기록(최근 5개)", value=" → ".join(history[-5:]), inline=False)
     embed.add_field(name="스팀 프로필", value=f"[바로가기](https://steamcommunity.com/profiles/{sid})", inline=False)
-    embed.set_footer(text=f"ID: {sid} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    embed.set_footer(text=f"ID: {sid} | {datetime.now().strftime('%H:%M:%S')}")
     return embed
 
 async def is_admin_channel(i: discord.Interaction):
     gid = str(i.guild_id)
     admin_ch_id = db['channels'].get(gid, {}).get('admin')
     if not admin_ch_id or i.channel_id != admin_ch_id:
-        await i.response.send_message("❌ 관리 전용 채널이 아니거나 권한이 없습니다.", ephemeral=True)
+        await i.response.send_message("❌ 관리 전용 채널에서만 사용 가능합니다.", ephemeral=True)
         return False
     return True
 
@@ -124,10 +126,9 @@ class MyBot(commands.Bot):
                             chan = self.get_channel(channels['notify']) or await self.fetch_channel(channels['notify'])
                             if chan: await chan.send(embed=embed)
             except Exception as e:
-                print(f"⚠️ {key} 검사 중 오류: {e}")
+                print(f"⚠️ {key} 업데이트 오류: {e}")
                 
-        if changed: save_data(db, "Auto Update: Nickname change detected")
-        # 봇 상태 메시지 업데이트
+        if changed: save_data(db, "Auto Update: Nickname changed")
         await self.change_presence(activity=discord.Game(name=f"{len(db['users'])}명 감시 중"))
 
 bot = MyBot()
@@ -139,32 +140,45 @@ async def status_list(i: discord.Interaction):
     if not await is_admin_channel(i): return
     if not db['users']: return await i.response.send_message("📊 감시 중인 유저가 없습니다.")
     
-    header = "식별 별명 / 최근 닉네임 / SteamID"
-    separator = "-" * 50
-    rows = [header, separator]
+    await i.response.defer() 
     
+    rows = ["저장된별명 / 최근닉네임 / 스팀ID", "-" * 45]
     for nickname, data in db['users'].items():
+        # [수정된 부분] 별명이 없거나 비어있으면 '별명없음'으로 표시
+        display_name = nickname if (nickname and nickname.strip()) else "별명없음"
         recent = data['history'][-1] if data.get('history') else "기록 없음"
-        rows.append(f"{nickname} / {recent} / {data['steam_id']}")
+        rows.append(f"{display_name} / {recent} / {data['steam_id']}")
     
-    await i.response.send_message(f"📊 **실시간 감시 현황**\n```text\n" + "\n".join(rows) + "```")
+    full_text = "📊 **실시간 감시 현황 (로컬 데이터)**\n```text\n"
+    current_chunk = full_text
+    
+    for row in rows:
+        if len(current_chunk) + len(row) + 5 > 1950:
+            current_chunk += "```"
+            await i.followup.send(current_chunk)
+            current_chunk = "```text\n" + row + "\n"
+        else:
+            current_chunk += row + "\n"
+    
+    current_chunk += "```"
+    await i.followup.send(current_chunk)
 
 @bot.tree.command(name="추가", description="유저를 추가합니다.")
 async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     if not await is_admin_channel(i): return
     await i.response.defer()
 
-    if any(d['steam_id'] == steam_id for d in db['users'].values()):
-        return await i.followup.send("❌ 이미 등록된 ID입니다.")
+    for ex_name, data in db['users'].items():
+        if data['steam_id'] == steam_id:
+            return await i.followup.send(f"❌ 이미 등록된 ID입니다. (별명: `{ex_name if ex_name else '별명없음'}`)")
 
     players = await get_steam_users_info([steam_id])
     if not players: return await i.followup.send("❌ 정보를 찾을 수 없습니다.")
     player = players[0]
 
     final_name = nickname or player['personaname']
-    if final_name in db['users']: return await i.followup.send("❌ 중복된 별명입니다.")
+    if final_name in db['users']: return await i.followup.send(f"❌ `{final_name}` 별명은 이미 사용 중입니다.")
 
-    # 닉네임 기록 가져오기
     url = f"https://steamcommunity.com/profiles/{steam_id}/ajaxaliases"
     history = [player['personaname']]
     try:
@@ -179,6 +193,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     embed = create_status_embed(final_name, steam_id, history, mode="add", player=player)
     await i.followup.send(embed=embed)
 
+# (나머지 /내역, /삭제, /채널설정 명령어는 이전과 동일하게 유지됩니다.)
 @bot.tree.command(name="내역", description="유저 상세 정보를 조회합니다.")
 async def history_command(i: discord.Interaction, target: str):
     if not await is_admin_channel(i): return
@@ -203,23 +218,23 @@ async def delete_user(i: discord.Interaction, target: str):
     if target_key:
         del db['users'][target_key]
         save_data(db, f"User Deleted: {target_key}")
-        await i.response.send_message(f"✅ `{target_key}` 삭제 완료.")
+        await i.response.send_message(f"✅ `{target_key if target_key else '별명없음'}` 삭제 완료.")
     else: await i.response.send_message("❌ 대상을 찾을 수 없습니다.")
 
-@bot.tree.command(name="채널설정", description="채널 설정을 관리합니다.")
+@bot.tree.command(name="채널설정", description="채널 역할을 지정합니다.")
 @app_commands.choices(역할=[
-    app_commands.Choice(name="관리 채널 (명령어용)", value="admin"),
-    app_commands.Choice(name="알림 채널 (변경로그용)", value="notify")
+    app_commands.Choice(name="관리 채널", value="admin"),
+    app_commands.Choice(name="알림 채널", value="notify")
 ])
 async def set_channel(i: discord.Interaction, 역할: str):
     if not i.user.guild_permissions.administrator:
-        return await i.response.send_message("❌ 관리자만 가능합니다.", ephemeral=True)
+        return await i.response.send_message("❌ 서버 관리자만 가능합니다.", ephemeral=True)
     
     gid = str(i.guild_id)
     if gid not in db['channels']: db['channels'][gid] = {}
     db['channels'][gid][역할] = i.channel_id
     save_data(db, f"Channel Set: {역할}")
-    await i.response.send_message(f"✅ 이제 이 채널이 **{역할}** 역할을 수행합니다.")
+    await i.response.send_message(f"✅ 설정 완료: 이 채널은 이제 **{역할}** 역할을 수행합니다.")
 
 if __name__ == "__main__":
     if TOKEN: bot.run(TOKEN)
