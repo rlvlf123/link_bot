@@ -60,9 +60,7 @@ def create_status_embed(display_name, sid, history, mode="notify", player=None):
     colors = {"add": discord.Color.green(), "notify": discord.Color.gold(), "history": discord.Color.blue()}
     titles = {"add": "✨ 새 감시 대상 추가", "notify": "🔔 닉네임 변경 알림", "history": "📋 유저 정보 조회"}
     
-    # 별명이 없을 경우 표시 처리
     display_title = display_name if display_name else "별명없음"
-    
     embed = discord.Embed(title=titles.get(mode, "알림"), color=colors.get(mode, discord.Color.light_grey()))
     
     if player:
@@ -74,7 +72,21 @@ def create_status_embed(display_name, sid, history, mode="notify", player=None):
 
     embed.add_field(name="식별 별명", value=display_title, inline=True)
     embed.add_field(name="최신 닉네임", value=history[-1] if history else "없음", inline=True)
-    embed.add_field(name="변경 기록(최근 5개)", value=" → ".join(history[-5:]), inline=False)
+    
+    # --- [수정된 부분: 오래된 기록부터 생략 로직] ---
+    all_history_list = history.copy()
+    display_history = " → ".join(all_history_list)
+    
+    # 디스코드 필드 제한(1024자)을 넘지 않도록 앞에서부터 제거
+    if len(display_history) > 1000:
+        while len(" → ".join(all_history_list)) > 980:
+            if len(all_history_list) <= 1: break # 최소 하나는 남김
+            all_history_list.pop(0)
+        display_history = f"...(생략)... → " + " → ".join(all_history_list)
+    
+    embed.add_field(name=f"전체 변경 기록 ({len(history)}개)", value=display_history, inline=False)
+    # ----------------------------------------------
+
     embed.add_field(name="스팀 프로필", value=f"[바로가기](https://steamcommunity.com/profiles/{sid})", inline=False)
     embed.set_footer(text=f"ID: {sid} | {datetime.now().strftime('%H:%M:%S')}")
     return embed
@@ -123,8 +135,10 @@ class MyBot(commands.Bot):
                     embed = create_status_embed(key, sid, history, mode="notify", player=player)
                     for gid, channels in db['channels'].items():
                         if 'notify' in channels:
-                            chan = self.get_channel(channels['notify']) or await self.fetch_channel(channels['notify'])
-                            if chan: await chan.send(embed=embed)
+                            try:
+                                chan = self.get_channel(channels['notify']) or await self.fetch_channel(channels['notify'])
+                                if chan: await chan.send(embed=embed)
+                            except: continue
             except Exception as e:
                 print(f"⚠️ {key} 업데이트 오류: {e}")
                 
@@ -144,7 +158,6 @@ async def status_list(i: discord.Interaction):
     
     rows = ["저장된별명 / 최근닉네임 / 스팀ID", "-" * 45]
     for nickname, data in db['users'].items():
-        # [수정된 부분] 별명이 없거나 비어있으면 '별명없음'으로 표시
         display_name = nickname if (nickname and nickname.strip()) else "별명없음"
         recent = data['history'][-1] if data.get('history') else "기록 없음"
         rows.append(f"{display_name} / {recent} / {data['steam_id']}")
@@ -153,7 +166,7 @@ async def status_list(i: discord.Interaction):
     current_chunk = full_text
     
     for row in rows:
-        if len(current_chunk) + len(row) + 5 > 1950:
+        if len(current_chunk) + len(row) + 10 > 2000:
             current_chunk += "```"
             await i.followup.send(current_chunk)
             current_chunk = "```text\n" + row + "\n"
@@ -179,12 +192,16 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     final_name = nickname or player['personaname']
     if final_name in db['users']: return await i.followup.send(f"❌ `{final_name}` 별명은 이미 사용 중입니다.")
 
+    # 스팀 닉네임 히스토리 API 시도
     url = f"https://steamcommunity.com/profiles/{steam_id}/ajaxaliases"
     history = [player['personaname']]
     try:
-        res = requests.get(url, timeout=5)
+        res = await asyncio.to_thread(requests.get, url, timeout=5)
         if res.status_code == 200:
+            # 과거부터 현재 순으로 정렬
             history = [item['newname'] for item in res.json()][::-1]
+            if not history or history[-1] != player['personaname']:
+                history.append(player['personaname'])
     except: pass
         
     db['users'][final_name] = {'steam_id': steam_id, 'history': history}
@@ -193,7 +210,6 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     embed = create_status_embed(final_name, steam_id, history, mode="add", player=player)
     await i.followup.send(embed=embed)
 
-# (나머지 /내역, /삭제, /채널설정 명령어는 이전과 동일하게 유지됩니다.)
 @bot.tree.command(name="내역", description="유저 상세 정보를 조회합니다.")
 async def history_command(i: discord.Interaction, target: str):
     if not await is_admin_channel(i): return
@@ -218,7 +234,7 @@ async def delete_user(i: discord.Interaction, target: str):
     if target_key:
         del db['users'][target_key]
         save_data(db, f"User Deleted: {target_key}")
-        await i.response.send_message(f"✅ `{target_key if target_key else '별명없음'}` 삭제 완료.")
+        await i.response.send_message(f"✅ `{target_key}` 삭제 완료.")
     else: await i.response.send_message("❌ 대상을 찾을 수 없습니다.")
 
 @bot.tree.command(name="채널설정", description="채널 역할을 지정합니다.")
