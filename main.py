@@ -7,7 +7,7 @@ import os
 import asyncio
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from github import Github
+from github import Github, Auth  # 최신 인증 방식 위해 Auth 추가
 
 # --- [1. 설정 정보] ---
 TOKEN = os.getenv('DISCORD_TOKEN')
@@ -16,15 +16,19 @@ GH_TOKEN = os.getenv('GH_TOKEN')
 GH_REPO = os.getenv('GH_REPO')
 DATA_FILE = os.getenv('DATA_FILE', 'tracked_users.json')
 
+# GitHub 연결 (최신 Auth 방식 적용)
 try:
-    g = Github(GH_TOKEN)
+    auth = Auth.Token(GH_TOKEN)
+    g = Github(auth=auth)
     repo = g.get_repo(GH_REPO)
 except Exception as e:
     print(f"❌ GitHub 리포지토리 연결 실패: {e}")
+    repo = None
 
 # --- [2. 데이터 함수] ---
 def load_data():
     default_structure = {'users': {}, 'channels': {}}
+    if not repo: return default_structure
     try:
         content = repo.get_contents(DATA_FILE)
         data = json.loads(content.decoded_content.decode('utf-8'))
@@ -35,6 +39,7 @@ def load_data():
         return default_structure
 
 def save_data(data, message="Update tracked data"):
+    if not repo: return
     try:
         new_content = json.dumps(data, indent=4, ensure_ascii=False)
         content = repo.get_contents(DATA_FILE)
@@ -43,9 +48,10 @@ def save_data(data, message="Update tracked data"):
         try: repo.create_file(DATA_FILE, "Initial data create", new_content)
         except: print("❌ GitHub 저장 치명적 오류")
 
+# 초기 데이터 로드
 db = load_data()
 
-# --- [3. 유틸리티 & XML 파싱] ---
+# --- [3. 유틸리티 & 비공개 계정 처리] ---
 async def get_steam_users_info(steam_ids):
     if not steam_ids: return []
     ids_str = ",".join(steam_ids)
@@ -102,4 +108,9 @@ def create_status_embed(display_name, sid, history, mode="notify", player=None, 
     
     footer_text = f"ID: {sid} | {datetime.now().strftime('%H:%M:%S')}"
     if is_private: footer_text += " | 🛡️ XML 정밀 추적 중"
-    embed.set_footer(text=footer)
+    embed.set_footer(text=footer_text)
+    return embed
+
+async def is_admin_channel(i: discord.Interaction):
+    gid = str(i.guild_id)
+    admin_ch_id = db['channels'].get(gid, {}).get
