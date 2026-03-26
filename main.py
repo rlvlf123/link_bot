@@ -102,4 +102,4 @@ def create_status_embed(display_name, sid, history, mode="notify", player=None, 
     
     footer_text = f"ID: {sid} | {datetime.now().strftime('%H:%M:%S')}"
     if is_private: footer_text += " | 🛡️ XML 정밀 추적 중"
-    embed.set_footer(text=footer
+    embed.set_footer(text=footer)
