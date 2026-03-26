@@ -175,11 +175,27 @@ bot = MyBot()
 async def status_list(i: discord.Interaction):
     if not await is_admin_channel(i): return
     if not db['users']: return await i.response.send_message("📊 비어있음")
+    
     await i.response.defer()
-    msg = "📊 **감시 현황**\n```text\n별명 / 현재 / ID\n"
+    
+    header = "📊 **감시 현황**\n```text\n별명 / 현재 / ID\n"
+    footer = "```"
+    
+    current_msg = header
+    
+    # 2,000자 초과 시 나누어 보내기 위한 로직
     for k, v in db['users'].items():
-        msg += f"{k} / {v['history'][-1]} / {v['steam_id']}\n"
-    await i.followup.send(msg + "```")
+        line = f"{k} / {v['history'][-1]} / {v['steam_id']}\n"
+        
+        # 새로운 줄을 추가했을 때 2,000자를 넘는지 확인
+        if len(current_msg + line + footer) > 2000:
+            await i.followup.send(current_msg + footer)
+            current_msg = "```text\n" + line # 새 메시지 시작
+        else:
+            current_msg += line
+            
+    # 남은 내용 전송
+    await i.followup.send(current_msg + footer)
 
 @bot.tree.command(name="추가", description="유저 추가")
 async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
@@ -201,7 +217,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     history = [curr]
     if not is_p:
         try:
-            r = await asyncio.to_thread(requests.get, f"https://steamcommunity.com/profiles/{steam_id}/ajaxaliases", timeout=5)
+            r = await asyncio.to_thread(requests.get, f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/ajaxaliases", timeout=5)
             if r.status_code == 200:
                 history = [x['newname'] for x in r.json()][::-1]
                 if not history or history[-1] != curr: history.append(curr)
