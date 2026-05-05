@@ -126,24 +126,44 @@ class MyBot(commands.Bot):
     @tasks.loop(minutes=5.0)
     async def check_steam_nicknames(self):
         if not db['users']: return
+        
         ids = [d['steam_id'] for d in db['users'].values()]
         players = await get_steam_users_info(ids)
-        p_dict = {p['steamid']: p for p in players}
         
+        # [수정] API 응답이 완전히 비어있으면 네트워크 문제일 확률이 높으므로 무시
+        if not players:
+            return
+
+        p_dict = {p['steamid']: p for p in players}
         changed = False
+        
         for name_key, data in list(db['users'].items()):
             sid = data['steam_id']
             player = p_dict.get(sid)
-            is_private = (player.get('communityvisibilitystate') == 1) if player else True
-            curr_nick = player['personaname'] if player else await get_nickname_from_xml(sid)
             
-            if not curr_nick: continue
+            # API 우선, 없으면 XML 시도
+            curr_nick = None
+            is_private = True
+            
+            if player:
+                curr_nick = player.get('personaname')
+                is_private = (player.get('communityvisibilitystate') == 1)
+            else:
+                curr_nick = await get_nickname_from_xml(sid)
+            
+            # [수정] 닉네임을 가져오지 못했거나 빈 문자열인 경우 '변경'으로 간주하지 않음
+            if not curr_nick or curr_nick.strip() == "":
+                continue
             
             history = data.get('history', [])
+            
+            # [수정] 히스토리가 비어있거나, 마지막 저장된 닉네임과 다를 때만 실행
             if not history or curr_nick != history[-1]:
+                # 중복 알림 방지를 위한 추가 체크 (실제 닉네임이 이전과 다를 때만)
                 history.append(curr_nick)
                 db['users'][name_key]['history'] = history
                 changed = True
+                
                 embed = create_status_embed(name_key if name_key != "None" else None, sid, history, "notify", player, is_private)
                 for gid, chs in db['channels'].items():
                     if 'notify' in chs:
@@ -151,7 +171,9 @@ class MyBot(commands.Bot):
                             c = self.get_channel(chs['notify']) or await self.fetch_channel(chs['notify'])
                             if c: await c.send(embed=embed)
                         except: pass
-        if changed: save_data(db, "Auto Update: Nickname changed")
+                        
+        if changed: 
+            save_data(db, "Auto Update: Nickname changed")
 
 bot = MyBot()
 
@@ -165,12 +187,14 @@ async def status_list(i: discord.Interaction):
     
     user_count = len(db['users'])
     header = f"📊 **감시 현황 (총 {user_count}명 실시간 감시 중)**\n```text\n등록된별명 / 현재닉네임 / steamID\n"
-    footer = "```"
+    footer = "
+```"
     current_msg = header
     
     for k, v in db['users'].items():
         name_display = k if k != "None" else "별명없음"
-        line = f"{name_display} / {v['history'][-1]} / {v['steam_id']}\n"
+        last_nick = v['history'][-1] if v['history'] else "조회불가"
+        line = f"{name_display} / {last_nick} / {v['steam_id']}\n"
         
         if len(current_msg + line + footer) > 2000:
             await i.followup.send(current_msg + footer)
