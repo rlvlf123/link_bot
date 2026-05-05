@@ -59,7 +59,7 @@ db = load_data()
 async def get_steam_users_info(steam_ids):
     if not steam_ids: return []
     ids_str = ",".join(steam_ids)
-    url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={ids_str}"
+    url = f"[http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=](http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=){STEAM_API_KEY}&steamids={ids_str}"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=10)
         if res.status_code == 200:
@@ -68,7 +68,7 @@ async def get_steam_users_info(steam_ids):
     return []
 
 async def get_nickname_from_xml(steam_id):
-    url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
+    url = f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/?xml=1"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=8)
         if res.status_code == 200:
@@ -129,7 +129,6 @@ class MyBot(commands.Bot):
         
         ids = [d['steam_id'] for d in db['users'].values()]
         players = await get_steam_users_info(ids)
-        
         if not players: return
 
         p_dict = {p['steamid']: p for p in players}
@@ -138,7 +137,6 @@ class MyBot(commands.Bot):
         for name_key, data in list(db['users'].items()):
             sid = data['steam_id']
             player = p_dict.get(sid)
-            
             curr_nick = None
             is_private = True
             
@@ -152,7 +150,6 @@ class MyBot(commands.Bot):
                 continue
             
             history = data.get('history', [])
-            
             if not history or curr_nick != history[-1]:
                 history.append(curr_nick)
                 db['users'][name_key]['history'] = history
@@ -181,8 +178,7 @@ async def status_list(i: discord.Interaction):
     
     user_count = len(db['users'])
     header = f"📊 **감시 현황 (총 {user_count}명 실시간 감시 중)**\n```text\n등록된별명 / 현재닉네임 / steamID\n"
-    footer = "
-```"
+    footer = "```"
     current_msg = header
     
     for k, v in db['users'].items():
@@ -192,7 +188,8 @@ async def status_list(i: discord.Interaction):
         
         if len(current_msg + line + footer) > 2000:
             await i.followup.send(current_msg + footer)
-            current_msg = "```text\n" + line
+            current_msg = "
+```text\n" + line
         else:
             current_msg += line
     await i.followup.send(current_msg + footer)
@@ -218,7 +215,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     
     if not is_p:
         try:
-            r = await asyncio.to_thread(requests.get, f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/ajaxaliases", timeout=5)
+            r = await asyncio.to_thread(requests.get, f"https://steamcommunity.com/profiles/{steam_id}/ajaxaliases", timeout=5)
             if r.status_code == 200:
                 history = [x['newname'] for x in r.json()][::-1]
                 if not history or history[-1] != curr: history.append(curr)
