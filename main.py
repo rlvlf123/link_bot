@@ -59,7 +59,7 @@ db = load_data()
 async def get_steam_users_info(steam_ids):
     if not steam_ids: return []
     ids_str = ",".join(steam_ids)
-    url = f"[http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=](http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=){STEAM_API_KEY}&steamids={ids_str}"
+    url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={ids_str}"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=10)
         if res.status_code == 200:
@@ -68,7 +68,7 @@ async def get_steam_users_info(steam_ids):
     return []
 
 async def get_nickname_from_xml(steam_id):
-    url = f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/?xml=1"
+    url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=8)
         if res.status_code == 200:
@@ -126,36 +126,38 @@ class MyBot(commands.Bot):
     @tasks.loop(minutes=5.0)
     async def check_steam_nicknames(self):
         if not db['users']: return
-        
         ids = [d['steam_id'] for d in db['users'].values()]
         players = await get_steam_users_info(ids)
-        if not players: return
-
         p_dict = {p['steamid']: p for p in players}
-        changed = False
         
+        changed = False
         for name_key, data in list(db['users'].items()):
             sid = data['steam_id']
             player = p_dict.get(sid)
-            curr_nick = None
-            is_private = True
             
+            # 닉네임 획득 (API 우선, 실패 시 XML)
+            curr_nick = None
             if player:
                 curr_nick = player.get('personaname')
-                is_private = (player.get('communityvisibilitystate') == 1)
             else:
                 curr_nick = await get_nickname_from_xml(sid)
             
-            if not curr_nick or curr_nick.strip() == "":
+            # 닉네임을 가져오는 데 실패했으면 이번 루프는 건너뜀 (안전 장치)
+            if not curr_nick or not curr_nick.strip():
                 continue
             
+            curr_nick = curr_nick.strip()
             history = data.get('history', [])
+            
+            # 마지막 기록과 다를 때만 업데이트 진행
             if not history or curr_nick != history[-1]:
                 history.append(curr_nick)
                 db['users'][name_key]['history'] = history
                 changed = True
                 
+                is_private = (player.get('communityvisibilitystate') == 1) if player else True
                 embed = create_status_embed(name_key if name_key != "None" else None, sid, history, "notify", player, is_private)
+                
                 for gid, chs in db['channels'].items():
                     if 'notify' in chs:
                         try:
@@ -178,48 +180,65 @@ async def status_list(i: discord.Interaction):
     
     user_count = len(db['users'])
     header = f"📊 **감시 현황 (총 {user_count}명 실시간 감시 중)**\n```text\n등록된별명 / 현재닉네임 / steamID\n"
-    footer = "```"
+    footer = "
+```"
     current_msg = header
     
     for k, v in db['users'].items():
         name_display = k if k != "None" else "별명없음"
-        last_nick = v['history'][-1] if v.get('history') else "데이터 없음"
+        last_nick = v['history'][-1] if v['history'] else "정보없음"
         line = f"{name_display} / {last_nick} / {v['steam_id']}\n"
         
         if len(current_msg + line + footer) > 2000:
             await i.followup.send(current_msg + footer)
-            current_msg = "
-```text\n" + line
+            current_msg = "```text\n" + line
         else:
             current_msg += line
     await i.followup.send(current_msg + footer)
 
-@bot.tree.command(name="추가", description="유저 추가")
+@bot.tree.command(name="추가", description="유저 추가 (중복 체크 포함)")
 async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     if not await is_admin_channel(i): return
     await i.response.defer()
 
+    # ID 중복 체크
     for name, data in db['users'].items():
         if data['steam_id'] == steam_id:
-            return await i.followup.send(f"❌ 이미 등록된 SteamID입니다. (별명: `{name}`)")
+            existing_name = name if name != "None" else "별명없음"
+            return await i.followup.send(f"❌ 이미 등록된 SteamID입니다. (등록된 별명: `{existing_name}`)")
+
+    # 별명 중복 체크
+    if nickname and nickname in db['users']:
+        return await i.followup.send(f"❌ 이미 존재하는 별명입니다: `{nickname}`")
 
     players = await get_steam_users_info([steam_id])
     player = players[0] if players else None
     is_p = (player.get('communityvisibilitystate') == 1) if player else True
+    
     curr = player['personaname'] if player else await get_nickname_from_xml(steam_id)
+    if not curr: 
+        return await i.followup.send("❌ 유효하지 않은 SteamID이거나 정보를 불러올 수 없습니다.")
     
-    if not curr: return await i.followup.send("❌ SteamID를 확인할 수 없습니다.")
+    curr = curr.strip()
+    name_key = str(nickname)
+    history = []
 
-    name_key = str(nickname) if nickname else "None"
-    history = [curr]
-    
-    if not is_p:
-        try:
-            r = await asyncio.to_thread(requests.get, f"https://steamcommunity.com/profiles/{steam_id}/ajaxaliases", timeout=5)
-            if r.status_code == 200:
-                history = [x['newname'] for x in r.json()][::-1]
-                if not history or history[-1] != curr: history.append(curr)
-        except: pass
+    # 과거 닉네임 내역 가져오기 (비공개 계정이 아닐 때)
+    try:
+        r = await asyncio.to_thread(requests.get, f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/ajaxaliases", timeout=5)
+        if r.status_code == 200:
+            raw_data = r.json()
+            # 과거 기록들을 중복 없이 정제
+            raw_history = [x['newname'].strip() for x in raw_data][::-1]
+            for h in raw_history:
+                if not history or h != history[-1]:
+                    history.append(h)
+    except: 
+        pass
+
+    # 현재 닉네임이 기록의 마지막과 다르면 추가
+    if not history or history[-1] != curr:
+        history.append(curr)
 
     db['users'][name_key] = {'steam_id': steam_id, 'history': history}
     save_data(db, f"Added: {name_key}")
@@ -244,7 +263,7 @@ async def user_history(i: discord.Interaction, search_value: str):
                 break
     
     if not target_data:
-        return await i.followup.send(f"❌ `{search_value}` 결과를 찾을 수 없습니다.")
+        return await i.followup.send(f"❌ 검색 결과가 없습니다: `{search_value}`")
 
     sid = target_data['steam_id']
     history = target_data.get('history', [])
@@ -252,10 +271,10 @@ async def user_history(i: discord.Interaction, search_value: str):
     player = players[0] if players else None
     is_private = (player.get('communityvisibilitystate') == 1) if player else True
 
-    embed = create_status_embed(target_name, sid, history, "history", player, is_private)
+    embed = create_status_embed(target_name if target_name != "None" else None, sid, history, "history", player, is_private)
     await i.followup.send(embed=embed)
 
-@bot.tree.command(name="삭제", description="유저 삭제")
+@bot.tree.command(name="삭제", description="유저 삭제 (별명 또는 ID 입력)")
 async def delete_user(i: discord.Interaction, target: str):
     if not await is_admin_channel(i): return
     
@@ -273,12 +292,12 @@ async def delete_user(i: discord.Interaction, target: str):
         save_data(db, f"Deleted: {key_to_del}")
         await i.response.send_message(f"✅ `{target}` 삭제 완료")
     else:
-        await i.response.send_message("❌ 대상을 찾을 수 없습니다.")
+        await i.response.send_message("❌ 해당 별명 또는 SteamID를 찾을 수 없습니다.")
 
 @bot.tree.command(name="채널설정", description="채널 설정")
 @app_commands.choices(역할=[app_commands.Choice(name="관리", value="admin"), app_commands.Choice(name="알림", value="notify")])
 async def set_channel(i: discord.Interaction, 역할: str):
-    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ 권한이 없습니다.")
+    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ 권한없음")
     gid = str(i.guild_id)
     if gid not in db['channels']: db['channels'][gid] = {}
     db['channels'][gid][역할] = i.channel_id
