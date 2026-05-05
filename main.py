@@ -130,8 +130,7 @@ class MyBot(commands.Bot):
         ids = [d['steam_id'] for d in db['users'].values()]
         players = await get_steam_users_info(ids)
         
-        if not players:
-            return
+        if not players: return
 
         p_dict = {p['steamid']: p for p in players}
         changed = False
@@ -188,7 +187,7 @@ async def status_list(i: discord.Interaction):
     
     for k, v in db['users'].items():
         name_display = k if k != "None" else "별명없음"
-        last_nick = v['history'][-1] if v['history'] else "조회불가"
+        last_nick = v['history'][-1] if v.get('history') else "데이터 없음"
         line = f"{name_display} / {last_nick} / {v['steam_id']}\n"
         
         if len(current_msg + line + footer) > 2000:
@@ -219,7 +218,6 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     
     if not is_p:
         try:
-            # [수정] 대괄호 제거 및 URL 정상화
             r = await asyncio.to_thread(requests.get, f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/ajaxaliases", timeout=5)
             if r.status_code == 200:
                 history = [x['newname'] for x in r.json()][::-1]
@@ -230,7 +228,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     save_data(db, f"Added: {name_key}")
     await i.followup.send(embed=create_status_embed(nickname, steam_id, history, "add", player, is_p))
 
-@bot.tree.command(name="내역", description="내역 조회")
+@bot.tree.command(name="내역", description="별명 또는 SteamID로 변경 내역 조회")
 async def user_history(i: discord.Interaction, search_value: str):
     if not await is_admin_channel(i): return
     await i.response.defer()
