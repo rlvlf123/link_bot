@@ -130,7 +130,6 @@ class MyBot(commands.Bot):
         ids = [d['steam_id'] for d in db['users'].values()]
         players = await get_steam_users_info(ids)
         
-        # [수정] API 응답이 완전히 비어있으면 네트워크 문제일 확률이 높으므로 무시
         if not players:
             return
 
@@ -141,7 +140,6 @@ class MyBot(commands.Bot):
             sid = data['steam_id']
             player = p_dict.get(sid)
             
-            # API 우선, 없으면 XML 시도
             curr_nick = None
             is_private = True
             
@@ -151,15 +149,12 @@ class MyBot(commands.Bot):
             else:
                 curr_nick = await get_nickname_from_xml(sid)
             
-            # [수정] 닉네임을 가져오지 못했거나 빈 문자열인 경우 '변경'으로 간주하지 않음
             if not curr_nick or curr_nick.strip() == "":
                 continue
             
             history = data.get('history', [])
             
-            # [수정] 히스토리가 비어있거나, 마지막 저장된 닉네임과 다를 때만 실행
             if not history or curr_nick != history[-1]:
-                # 중복 알림 방지를 위한 추가 체크 (실제 닉네임이 이전과 다를 때만)
                 history.append(curr_nick)
                 db['users'][name_key]['history'] = history
                 changed = True
@@ -203,31 +198,28 @@ async def status_list(i: discord.Interaction):
             current_msg += line
     await i.followup.send(current_msg + footer)
 
-@bot.tree.command(name="추가", description="유저 추가 (중복 체크 포함)")
+@bot.tree.command(name="추가", description="유저 추가")
 async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     if not await is_admin_channel(i): return
     await i.response.defer()
 
     for name, data in db['users'].items():
         if data['steam_id'] == steam_id:
-            existing_name = name if name != "None" else "별명없음"
-            return await i.followup.send(f"❌ 이미 등록된 SteamID입니다. (등록된 별명: `{existing_name}`)")
-
-    if nickname and nickname in db['users']:
-        return await i.followup.send(f"❌ 이미 존재하는 별명입니다: `{nickname}`")
+            return await i.followup.send(f"❌ 이미 등록된 SteamID입니다. (별명: `{name}`)")
 
     players = await get_steam_users_info([steam_id])
     player = players[0] if players else None
     is_p = (player.get('communityvisibilitystate') == 1) if player else True
     curr = player['personaname'] if player else await get_nickname_from_xml(steam_id)
     
-    if not curr: return await i.followup.send("❌ 유효하지 않은 SteamID이거나 정보를 불러올 수 없습니다.")
+    if not curr: return await i.followup.send("❌ SteamID를 확인할 수 없습니다.")
 
-    name_key = str(nickname)
+    name_key = str(nickname) if nickname else "None"
     history = [curr]
     
     if not is_p:
         try:
+            # [수정] 대괄호 제거 및 URL 정상화
             r = await asyncio.to_thread(requests.get, f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/ajaxaliases", timeout=5)
             if r.status_code == 200:
                 history = [x['newname'] for x in r.json()][::-1]
@@ -238,7 +230,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     save_data(db, f"Added: {name_key}")
     await i.followup.send(embed=create_status_embed(nickname, steam_id, history, "add", player, is_p))
 
-@bot.tree.command(name="내역", description="별명 또는 SteamID로 변경 내역 조회")
+@bot.tree.command(name="내역", description="내역 조회")
 async def user_history(i: discord.Interaction, search_value: str):
     if not await is_admin_channel(i): return
     await i.response.defer()
@@ -257,7 +249,7 @@ async def user_history(i: discord.Interaction, search_value: str):
                 break
     
     if not target_data:
-        return await i.followup.send(f"❌ 검색 결과가 없습니다: `{search_value}`")
+        return await i.followup.send(f"❌ `{search_value}` 결과를 찾을 수 없습니다.")
 
     sid = target_data['steam_id']
     history = target_data.get('history', [])
@@ -265,10 +257,10 @@ async def user_history(i: discord.Interaction, search_value: str):
     player = players[0] if players else None
     is_private = (player.get('communityvisibilitystate') == 1) if player else True
 
-    embed = create_status_embed(target_name if target_name != "None" else None, sid, history, "history", player, is_private)
+    embed = create_status_embed(target_name, sid, history, "history", player, is_private)
     await i.followup.send(embed=embed)
 
-@bot.tree.command(name="삭제", description="유저 삭제 (별명 또는 ID 입력)")
+@bot.tree.command(name="삭제", description="유저 삭제")
 async def delete_user(i: discord.Interaction, target: str):
     if not await is_admin_channel(i): return
     
@@ -286,12 +278,12 @@ async def delete_user(i: discord.Interaction, target: str):
         save_data(db, f"Deleted: {key_to_del}")
         await i.response.send_message(f"✅ `{target}` 삭제 완료")
     else:
-        await i.response.send_message("❌ 해당 별명 또는 SteamID를 찾을 수 없습니다.")
+        await i.response.send_message("❌ 대상을 찾을 수 없습니다.")
 
 @bot.tree.command(name="채널설정", description="채널 설정")
 @app_commands.choices(역할=[app_commands.Choice(name="관리", value="admin"), app_commands.Choice(name="알림", value="notify")])
 async def set_channel(i: discord.Interaction, 역할: str):
-    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ 권한없음")
+    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ 권한이 없습니다.")
     gid = str(i.guild_id)
     if gid not in db['channels']: db['channels'][gid] = {}
     db['channels'][gid][역할] = i.channel_id
