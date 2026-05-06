@@ -135,23 +135,37 @@ class MyBot(commands.Bot):
             sid = data['steam_id']
             player = p_dict.get(sid)
             
-            # 1. 닉네임 정보 획득 (API 우선, 실패 시 XML)
             curr_nick = None
-            if player and 'personaname' in player:
-                curr_nick = player['personaname']
+            is_private = False
+
+            # 1. 계정 공개 여부 및 닉네임 추출 로직 엄격화
+            if player:
+                # communityvisibilitystate: 3은 공개, 1은 비공개
+                if player.get('communityvisibilitystate') == 3:
+                    curr_nick = player.get('personaname')
+                    is_private = False
+                else:
+                    # 비공개 계정일 경우 XML 호출
+                    curr_nick = await get_nickname_from_xml(sid)
+                    is_private = True
             else:
+                # API 응답에 아예 없을 경우 (Steam 서버 일시 오류 등) XML 시도
                 curr_nick = await get_nickname_from_xml(sid)
-            
-            # 2. 유효성 검사: 닉네임을 아예 못 가져온 경우(API 일시적 오류 등)는 스킵하여 오작동 방지
-            if not curr_nick:
+                is_private = True
+
+            # 2. 데이터 무결성 체크 (중요: 닉네임이 None이거나 빈 문자열이면 절대 처리하지 않음)
+            if not curr_nick or curr_nick.strip() == "":
                 continue
                 
-            is_private = (player.get('communityvisibilitystate') == 1) if player else True
             history = data.get('history', [])
             
-            # 3. 비교 로직 강화: 기록이 없거나 최신 기록과 다를 때만 업데이트
-            if not history or curr_nick != history[-1]:
-                # 중복 감지 방지: 만약 API 지연으로 잠시 None이었다가 돌아온 경우 등 예외 처리
+            # 3. 변경 감지 (기록이 있고, 최신 기록과 현재 이름이 다를 때만)
+            if history and curr_nick != history[-1]:
+                # 간혹 API 지연으로 이전 닉네임이 다시 들어오는 경우(고스트 현상) 방지
+                # 닉네임 기록 중 뒤에서 두 번째 값과 같다면 일시적 오류로 판단하고 무시
+                if len(history) >= 2 and curr_nick == history[-2]:
+                    continue
+
                 history.append(curr_nick)
                 db['users'][name_key]['history'] = history
                 changed = True
@@ -163,7 +177,12 @@ class MyBot(commands.Bot):
                             c = self.get_channel(chs['notify']) or await self.fetch_channel(chs['notify'])
                             if c: await c.send(embed=embed)
                         except: pass
-        
+            
+            # 기록이 아예 없는 신규 유저 예외 처리
+            elif not history:
+                db['users'][name_key]['history'] = [curr_nick]
+                changed = True
+
         if changed: 
             save_data(db, "Auto Update: Nickname changed")
 
@@ -174,17 +193,17 @@ bot = MyBot()
 async def status_list(i: discord.Interaction):
     if not await is_admin_channel(i): return
     if not db['users']: return await i.response.send_message("📊 감시 중인 유저가 없습니다.")
-    
     await i.response.defer()
     
     user_count = len(db['users'])
     header = f"📊 **감시 현황 (총 {user_count}명 실시간 감시 중)**\n```text\n등록된별명 / 현재닉네임 / steamID\n"
-    footer = "```"
+    footer = "
+```"
     current_msg = header
     
     for k, v in db['users'].items():
         name_display = k if k != "None" else "별명없음"
-        last_nick = v['history'][-1] if v.get('history') else "확인불가"
+        last_nick = v['history'][-1] if v.get('history') else "정보없음"
         line = f"{name_display} / {last_nick} / {v['steam_id']}\n"
         
         if len(current_msg + line + footer) > 2000:
@@ -209,25 +228,33 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
 
     players = await get_steam_users_info([steam_id])
     player = players[0] if players else None
-    is_p = (player.get('communityvisibilitystate') == 1) if player else True
     
     curr = None
-    if player and 'personaname' in player:
-        curr = player['personaname']
+    is_p = True
+    if player:
+        if player.get('communityvisibilitystate') == 3:
+            curr = player.get('personaname')
+            is_p = False
+        else:
+            curr = await get_nickname_from_xml(steam_id)
+            is_p = True
     else:
         curr = await get_nickname_from_xml(steam_id)
+        is_p = True
     
     if not curr: return await i.followup.send("❌ 유효하지 않은 SteamID이거나 정보를 불러올 수 없습니다.")
 
     name_key = str(nickname)
     history = [curr]
     
-    if not is_p:
+    if is_p: # 비공개 계정인 경우 과거 기록 시도
         try:
             r = await asyncio.to_thread(requests.get, f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/ajaxaliases", timeout=5)
             if r.status_code == 200:
-                history = [x['newname'] for x in r.json()][::-1]
-                if not history or history[-1] != curr: history.append(curr)
+                scraped = [x['newname'] for x in r.json()][::-1]
+                if scraped:
+                    history = scraped
+                    if history[-1] != curr: history.append(curr)
         except: pass
 
     db['users'][name_key] = {'steam_id': steam_id, 'history': history}
@@ -259,7 +286,7 @@ async def user_history(i: discord.Interaction, search_value: str):
     history = target_data.get('history', [])
     players = await get_steam_users_info([sid])
     player = players[0] if players else None
-    is_private = (player.get('communityvisibilitystate') == 1) if player else True
+    is_private = (player.get('communityvisibilitystate') != 3) if player else True
 
     embed = create_status_embed(target_name if target_name != "None" else None, sid, history, "history", player, is_private)
     await i.followup.send(embed=embed)
@@ -267,7 +294,6 @@ async def user_history(i: discord.Interaction, search_value: str):
 @bot.tree.command(name="삭제", description="유저 삭제 (별명 또는 ID 입력)")
 async def delete_user(i: discord.Interaction, target: str):
     if not await is_admin_channel(i): return
-    
     key_to_del = None
     if target in db['users']:
         key_to_del = target
