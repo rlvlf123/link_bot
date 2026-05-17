@@ -20,10 +20,16 @@ def init_db():
         os.makedirs(db_dir)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                        NAME TEXT PRIMARY KEY,
-                        STEAM_ID TEXT,
-                        HISTORY TEXT)''')
+    # 💡 어떤 구조의 DB가 오든 에러가 나지 않도록 유연하게 필드명을 결정하는 내부 유틸 함수
+    try:
+        cursor.execute("SELECT * FROM users LIMIT 1")
+    except sqlite3.OperationalError:
+        # 테이블이 아예 없다면 새로 생성합니다.
+        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                            name_key TEXT PRIMARY KEY,
+                            steam_id TEXT,
+                            history TEXT)''')
+    
     cursor.execute('''CREATE TABLE IF NOT EXISTS channels (
                         guild_id TEXT PRIMARY KEY,
                         admin_id INTEGER,
@@ -35,6 +41,24 @@ init_db()
 
 def get_db():
     return sqlite3.connect(DB_PATH)
+
+def get_column_names():
+    """DB 파일의 실제 컬럼명 구조(대문자 또는 소문자)를 감지하여 반환합니다."""
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA table_info(users);")
+        cols = [c[1].lower() for c in cursor.fetchall()]
+        conn.close()
+        
+        # 소문자/대문자 맵핑 반환
+        name_col = "name_key" if "name_key" in cols else "NAME"
+        sid_col = "steam_id" if "steam_id" in cols else "STEAM_ID"
+        hist_col = "history" if "history" in cols else "HISTORY"
+        return name_col, sid_col, hist_col
+    except:
+        conn.close()
+        return "name_key", "steam_id", "history"
 
 # --- [3. 유틸리티 ] ---
 async def get_steam_users_info(steam_ids):
@@ -96,9 +120,11 @@ class MyBot(commands.Bot):
 
     @tasks.loop(minutes=5.0)
     async def check_steam_nicknames(self):
+        name_col, sid_col, hist_col = get_column_names()
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT NAME, STEAM_ID, HISTORY FROM users")
+        
+        cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users")
         rows = cursor.fetchall()
         
         if not rows:
@@ -120,7 +146,7 @@ class MyBot(commands.Bot):
             if len(history) >= 2 and curr_nick == history[-2]: continue
 
             history.append(curr_nick)
-            cursor.execute("UPDATE users SET HISTORY = ? WHERE NAME = ?", (" | ".join(history), name_key))
+            cursor.execute(f"UPDATE users SET {hist_col} = ? WHERE {name_col} = ?", (" | ".join(history), name_key))
             conn.commit()
             
             embed = create_status_embed(name_key, sid, history, "notify", player, player.get('communityvisibilitystate') != 3 if player else True)
@@ -138,11 +164,12 @@ bot = MyBot()
 @bot.tree.command(name="추가", description="유저 추가 (별명 생략 시 스팀 닉네임으로 자동 등록)")
 async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     await i.response.defer()
+    name_col, sid_col, hist_col = get_column_names()
     conn = get_db()
     cursor = conn.cursor()
     
-    # 1) 먼저 해당 스팀 아이디가 이미 존재하는지 전면 검사
-    cursor.execute("SELECT NAME, STEAM_ID, HISTORY FROM users WHERE STEAM_ID = ?", (steam_id,))
+    # 1) 스팀 아이디 중복 전면 검사
+    cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users WHERE {sid_col} = ?", (steam_id,))
     exist_sid_row = cursor.fetchone()
     
     if exist_sid_row:
@@ -154,7 +181,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
         embed = create_status_embed(exist_name, exist_sid, history_list, "exist", player)
         return await i.followup.send(content="❌ 이미 감시 목록에 등록되어 있는 스팀 ID입니다!", embed=embed)
 
-    # 2) 스팀 프로필 정보 긁어오기
+    # 2) 스팀 프로필 정보 조회
     players = await get_steam_users_info([steam_id])
     player = players[0] if players else None
     curr = (player.get('personaname') if player and player.get('communityvisibilitystate') == 3 
@@ -164,11 +191,10 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
         conn.close()
         return await i.followup.send("❌ 유효하지 않거나 비공개/정지된 SteamID입니다.")
 
-    # 💡 [핵심 구현] 만약 명령어 입력 시 별명을 안 적었다면(None) 스팀 실시간 닉네임을 기본 별명으로 강제 지정합니다.
     final_nickname = nickname.strip() if nickname else curr.strip()
 
-    # 3) 새로 등록하려는 별명이 이미 존재하는지 한 번 더 검사 (Primary Key 충돌 방지)
-    cursor.execute("SELECT NAME, STEAM_ID, HISTORY FROM users WHERE NAME = ?", (final_nickname,))
+    # 3) 새로 등록하려는 별명 중복 검사
+    cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users WHERE {name_col} = ?", (final_nickname,))
     exist_name_row = cursor.fetchone()
     if exist_name_row:
         exist_name, exist_sid, exist_hist = exist_name_row
@@ -177,17 +203,18 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
         embed = create_status_embed(exist_name, exist_sid, history_list, "exist", player)
         return await i.followup.send(content=f"❌ 이미 `{final_nickname}`이라는 별명으로 등록된 다른 유저가 존재합니다!", embed=embed)
 
-    # 4) DB에 최종 인서트
-    cursor.execute("INSERT INTO users (NAME, STEAM_ID, HISTORY) VALUES (?, ?, ?)", (final_nickname, steam_id, curr))
+    # 4) DB 저장
+    cursor.execute(f"INSERT INTO users ({name_col}, {sid_col}, {hist_col}) VALUES (?, ?, ?)", (final_nickname, steam_id, curr))
     conn.commit()
     conn.close()
     await i.followup.send(embed=create_status_embed(final_nickname, steam_id, [curr], "add", player))
 
 @bot.tree.command(name="현황", description="전체 리스트 확인")
 async def status_list(i: discord.Interaction):
+    name_col, sid_col, hist_col = get_column_names()
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT NAME, STEAM_ID, HISTORY FROM users")
+    cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users")
     rows = cursor.fetchall()
     conn.close()
 
@@ -212,11 +239,11 @@ async def status_list(i: discord.Interaction):
 
 @bot.tree.command(name="내역", description="특정 유저의 변경 내역 확인 (별명 또는 스팀아이디 입력 가능)")
 async def user_history(i: discord.Interaction, target: str):
+    name_col, sid_col, hist_col = get_column_names()
     conn = get_db()
     cursor = conn.cursor()
     
-    # 💡 [핵심 구현] 입력값(target)이 NAME(별명)이거나 STEAM_ID(스팀아이디)인 경우 둘 다 조회할 수 있게 쿼리 작동
-    cursor.execute("SELECT NAME, STEAM_ID, HISTORY FROM users WHERE NAME = ? OR STEAM_ID = ?", (target.strip(), target.strip()))
+    cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users WHERE {name_col} = ? OR {sid_col} = ?", (target.strip(), target.strip()))
     row = cursor.fetchone()
     conn.close()
 
@@ -231,9 +258,10 @@ async def user_history(i: discord.Interaction, target: str):
 
 @bot.tree.command(name="삭제", description="유저 삭제 (별명 또는 스팀아이디 입력 가능)")
 async def delete_user(i: discord.Interaction, target: str):
+    name_col, sid_col, hist_col = get_column_names()
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM users WHERE NAME = ? OR STEAM_ID = ?", (target.strip(), target.strip()))
+    cursor.execute(f"DELETE FROM users WHERE {name_col} = ? OR {sid_col} = ?", (target.strip(), target.strip()))
     if cursor.rowcount > 0:
         conn.commit()
         await i.response.send_message(f"✅ `{target}` 삭제 완료")
