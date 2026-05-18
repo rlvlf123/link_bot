@@ -1,4 +1,4 @@
-```python
+python
 # 수정된 전체 코드 (오류 수정 완료 버전)
 
 import discord
@@ -456,4 +456,3 @@ async def add_user(
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-```
