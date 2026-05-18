@@ -821,6 +821,12 @@ if dup_name:
 # =========================
 
 @bot.tree.command(name="삭제", description="알림 감시 해제")
+
+# =========================
+# /삭제
+# =========================
+
+@bot.tree.command(name="삭제", description="알림 감시 해제")
 async def delete_user(
     i: discord.Interaction,
     target: str
