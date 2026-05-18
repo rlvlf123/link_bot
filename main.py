@@ -1,3 +1,6 @@
+# 수정된 전체 코드 (핵심 통합 버전)
+
+````python
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -8,8 +11,12 @@ import os
 import asyncio
 import re
 import xml.etree.ElementTree as ET
+import time
 
 from datetime import datetime
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # =========================
 # 설정
@@ -18,6 +25,15 @@ from datetime import datetime
 TOKEN = os.getenv("DISCORD_TOKEN")
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+
+SAVE_DIR = r"C:\Users\peal\AppData\Local\Longvinter\Saved\SaveGames"
+
+WATCH_FILES = [
+    "[KR]Uuvana1-seenplayers.sav",
+    "[KR]Uuvana2-seenplayers.sav",
+    "[KR]Uuvana3-seenplayers.sav",
+    "[KR]UuvanaHARDCORE-seenplayers.sav"
+]
 
 # =========================
 # DB
@@ -36,12 +52,8 @@ def get_db():
 
     return conn
 
+
 def init_db():
-
-    db_dir = os.path.dirname(DB_PATH)
-
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir)
 
     conn = get_db()
 
@@ -77,169 +89,13 @@ def init_db():
             )
         """)
 
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_history_steam
-            ON nickname_history(steam_id)
-        """)
-
-        cursor.execute("PRAGMA table_info(users)")
-
-        cols = [c[1] for c in cursor.fetchall()]
-
-        alter_queries = []
-
-        if "current_name" not in cols:
-            alter_queries.append(
-                "ALTER TABLE users ADD COLUMN current_name TEXT"
-            )
-
-        if "eos_id" not in cols:
-            alter_queries.append(
-                "ALTER TABLE users ADD COLUMN eos_id TEXT"
-            )
-
-        if "updated_at" not in cols:
-            alter_queries.append(
-                "ALTER TABLE users ADD COLUMN updated_at TEXT"
-            )
-
-        if "is_monitored" not in cols:
-            alter_queries.append(
-                "ALTER TABLE users ADD COLUMN is_monitored INTEGER DEFAULT 0"
-            )
-
-        for q in alter_queries:
-
-            try:
-                cursor.execute(q)
-
-            except Exception as e:
-                print(f"[ALTER 오류] {e}")
-
         conn.commit()
 
     finally:
         conn.close()
 
-def repair_current_names():
-
-    conn = get_db()
-
-    try:
-
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            UPDATE users
-            SET current_name = name_key
-            WHERE current_name IS NULL
-            OR current_name = ''
-        """)
-
-        conn.commit()
-
-    except Exception as e:
-        print(f"[DB 복구 오류] {e}")
-
-    finally:
-        conn.close()
-
-def get_history_list(cursor, steam_id):
-
-    cursor.execute("""
-        SELECT nickname
-        FROM nickname_history
-        WHERE steam_id = ?
-        ORDER BY id ASC
-    """, (steam_id,))
-
-    return [row[0] for row in cursor.fetchall()]
 
 init_db()
-repair_current_names()
-def migrate_old_history():
-
-    conn = get_db()
-
-    try:
-
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT steam_id, history
-            FROM users
-            WHERE history IS NOT NULL
-            AND history != ''
-        """)
-
-        rows = cursor.fetchall()
-
-        migrated = 0
-
-        for sid, history_str in rows:
-
-            history_list = history_str.split(" | ")
-
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM nickname_history
-                WHERE steam_id = ?
-            """, (sid,))
-
-            already_count = cursor.fetchone()[0]
-
-            if already_count > 0:
-                continue
-
-            for nick in history_list:
-
-                nick = nick.strip()
-
-                if not nick:
-                    continue
-
-                cursor.execute("""
-                    INSERT INTO nickname_history (
-                        steam_id,
-                        nickname,
-                        changed_at
-                    )
-                    VALUES (?, ?, ?)
-                """, (
-                    sid,
-                    nick,
-                    datetime.now().isoformat()
-                ))
-
-            migrated += 1
-
-        conn.commit()
-
-        print(f"[DB] 히스토리 이전 완료: {migrated}명")
-
-    finally:
-        conn.close()
-        migrate_old_history()
-def enable_all_monitored():
-
-    conn = get_db()
-
-    try:
-
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            UPDATE users
-            SET is_monitored = 1
-        """)
-
-        conn.commit()
-
-        print("[DB] 모든 유저 감시 활성화 완료")
-
-    finally:
-        conn.close()
-enable_all_monitored()
 
 # =========================
 # Steam API
@@ -281,6 +137,7 @@ async def get_steam_users_info(steam_ids):
 
     return []
 
+
 async def get_nickname_from_xml(steam_id):
 
     url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
@@ -302,8 +159,8 @@ async def get_nickname_from_xml(steam_id):
             if node is not None and node.text:
                 return node.text.strip()
 
-    except Exception as e:
-        print(f"[XML 오류] {e}")
+    except Exception:
+        pass
 
     return None
 
@@ -318,38 +175,80 @@ def parse_sav_file(file_bytes):
     try:
 
         text_data = file_bytes.decode(
-            "utf-8",
+            "latin-1",
             errors="ignore"
         )
 
-        steam_ids = set(
-            re.findall(r"7656119\d{10}", text_data)
+        matches = re.findall(
+            r"([0-9a-f]{32}).{0,300}?(7656119\d{10})",
+            text_data,
+            re.IGNORECASE | re.DOTALL
         )
 
-        eos_ids = set(
-            re.findall(
-                r"[0-9a-f]{32}",
-                text_data,
-                re.IGNORECASE
-            )
-        )
+        unique = set()
 
-        for sid in steam_ids:
+        for eos_id, steam_id in matches:
 
-            eos = None
+            if steam_id in unique:
+                continue
 
-            if eos_ids:
-                eos = list(eos_ids)[0]
+            unique.add(steam_id)
 
             results.append({
-                "steam_id": sid,
-                "eos_id": eos
+                "steam_id": steam_id,
+                "eos_id": eos_id.lower()
             })
 
     except Exception as e:
         print(f"[SAV 파싱 오류] {e}")
 
     return results
+
+# =========================
+# 히스토리
+# =========================
+
+def get_history_list(cursor, steam_id):
+
+    cursor.execute("""
+        SELECT nickname
+        FROM nickname_history
+        WHERE steam_id = ?
+        ORDER BY id ASC
+    """, (steam_id,))
+
+    return [row[0] for row in cursor.fetchall()]
+
+
+def add_history_if_needed(cursor, steam_id, nickname):
+
+    cursor.execute("""
+        SELECT nickname
+        FROM nickname_history
+        WHERE steam_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (steam_id,))
+
+    row = cursor.fetchone()
+
+    if row and row[0] == nickname:
+        return False
+
+    cursor.execute("""
+        INSERT INTO nickname_history (
+            steam_id,
+            nickname,
+            changed_at
+        )
+        VALUES (?, ?, ?)
+    """, (
+        steam_id,
+        nickname,
+        datetime.now().isoformat()
+    ))
+
+    return True
 
 # =========================
 # EMBED
@@ -379,7 +278,7 @@ def create_status_embed(
 
     embed = discord.Embed(
         title=titles.get(mode, "알림"),
-        color=colors.get(mode, discord.Color.light_grey())
+        color=colors.get(mode)
     )
 
     if player:
@@ -387,20 +286,20 @@ def create_status_embed(
 
     embed.add_field(
         name="등록 별명",
-        value=display_name or "없음",
-        inline=True
+        value=display_name,
+        inline=False
     )
 
     embed.add_field(
         name="현재 닉네임",
         value=history[-1] if history else "없음",
-        inline=True
+        inline=False
     )
 
     history_text = " → ".join(history)
 
     if len(history_text) > 1000:
-        history_text = "... " + history_text[-950:]
+        history_text = history_text[-1000:]
 
     embed.add_field(
         name=f"닉네임 기록 ({len(history)}개)",
@@ -414,11 +313,212 @@ def create_status_embed(
         inline=False
     )
 
-    embed.set_footer(
-        text=f"{sid} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    )
-
     return embed
+
+# =========================
+# SAV WATCHER
+# =========================
+
+class SavWatcher(FileSystemEventHandler):
+
+    def __init__(self, bot):
+
+        self.bot = bot
+        self.last_run = {}
+
+    def on_modified(self, event):
+
+        filename = os.path.basename(event.src_path)
+
+        if filename not in WATCH_FILES:
+            return
+
+        now = time.time()
+
+        last = self.last_run.get(filename, 0)
+
+        if now - last < 3:
+            return
+
+        self.last_run[filename] = now
+
+        asyncio.run_coroutine_threadsafe(
+            self.process_file(event.src_path),
+            self.bot.loop
+        )
+
+    async def process_file(self, path):
+
+        try:
+
+            with open(path, "rb") as f:
+                file_bytes = f.read()
+
+            parsed = await asyncio.to_thread(
+                parse_sav_file,
+                file_bytes
+            )
+
+            if not parsed:
+                return
+
+            steam_ids = [
+                p["steam_id"]
+                for p in parsed
+            ]
+
+            players = await get_steam_users_info(steam_ids)
+
+            p_dict = {
+                p["steamid"]: p
+                for p in players
+            }
+
+            conn = get_db()
+
+            try:
+
+                cursor = conn.cursor()
+
+                cursor.execute("""
+                    SELECT notify_id
+                    FROM channels
+                """)
+
+                notify_channels = [
+                    x[0]
+                    for x in cursor.fetchall()
+                    if x[0]
+                ]
+
+                for item in parsed:
+
+                    sid = item["steam_id"]
+                    eos = item["eos_id"]
+
+                    player = p_dict.get(sid)
+
+                    curr = (
+                        player.get("personaname")
+                        if player and player.get("personaname")
+                        else None
+                    )
+
+                    if not curr:
+                        continue
+
+                    curr = curr.strip()
+
+                    cursor.execute("""
+                        SELECT
+                            current_name,
+                            is_monitored,
+                            name_key
+                        FROM users
+                        WHERE steam_id = ?
+                    """, (sid,))
+
+                    row = cursor.fetchone()
+
+                    if not row:
+
+                        save_name = f"user_{sid[-6:]}"
+
+                        cursor.execute("""
+                            INSERT INTO users (
+                                steam_id,
+                                name_key,
+                                current_name,
+                                eos_id,
+                                is_monitored,
+                                updated_at
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (
+                            sid,
+                            save_name,
+                            curr,
+                            eos,
+                            0,
+                            datetime.now().isoformat()
+                        ))
+
+                        add_history_if_needed(
+                            cursor,
+                            sid,
+                            curr
+                        )
+
+                        print(f"[자동 등록] {curr} ({sid})")
+
+                    else:
+
+                        old_name, monitored, name_key = row
+
+                        if old_name != curr:
+
+                            cursor.execute("""
+                                UPDATE users
+                                SET
+                                    current_name = ?,
+                                    eos_id = ?,
+                                    updated_at = ?
+                                WHERE steam_id = ?
+                            """, (
+                                curr,
+                                eos,
+                                datetime.now().isoformat(),
+                                sid
+                            ))
+
+                            added = add_history_if_needed(
+                                cursor,
+                                sid,
+                                curr
+                            )
+
+                            print(
+                                f"[닉변 감지] "
+                                f"{old_name} → {curr}"
+                            )
+
+                            if monitored == 1 and added:
+
+                                history = get_history_list(
+                                    cursor,
+                                    sid
+                                )
+
+                                embed = create_status_embed(
+                                    name_key,
+                                    sid,
+                                    history,
+                                    "notify",
+                                    player
+                                )
+
+                                for ch_id in notify_channels:
+
+                                    try:
+
+                                        ch = self.bot.get_channel(ch_id)
+
+                                        if not ch:
+                                            ch = await self.bot.fetch_channel(ch_id)
+
+                                        if ch:
+                                            await ch.send(embed=embed)
+
+                                    except Exception as e:
+                                        print(f"[알림 오류] {e}")
+
+                conn.commit()
+
+            finally:
+                conn.close()
+
+        except Exception as e:
+            print(f"[SAV 감시 오류] {e}")
 
 # =========================
 # BOT
@@ -443,10 +543,26 @@ class MyBot(commands.Bot):
 
         print(f"Logged in as {self.user}")
 
+        if not hasattr(self, "observer"):
+
+            event_handler = SavWatcher(self)
+
+            self.observer = Observer()
+
+            self.observer.schedule(
+                event_handler,
+                SAVE_DIR,
+                recursive=False
+            )
+
+            self.observer.start()
+
+            print("[SAV 실시간 감시 시작]")
+
         if not self.check_steam_nicknames.is_running():
             self.check_steam_nicknames.start()
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(minutes=10)
     async def check_steam_nicknames(self):
 
         conn = get_db()
@@ -458,24 +574,11 @@ class MyBot(commands.Bot):
             cursor.execute("""
                 SELECT
                     steam_id,
-                    name_key,
-                    current_name,
-                    is_monitored
+                    current_name
                 FROM users
             """)
 
             rows = cursor.fetchall()
-
-            cursor.execute("""
-                SELECT notify_id
-                FROM channels
-            """)
-
-            notify_channels = [
-                r[0]
-                for r in cursor.fetchall()
-                if r[0]
-            ]
 
         finally:
             conn.close()
@@ -492,94 +595,57 @@ class MyBot(commands.Bot):
             for p in players
         }
 
-        for sid, name_key, current_name, monitored in rows:
+        conn = get_db()
 
-            player = p_dict.get(sid)
+        try:
 
-            curr_nick = (
-                player.get("personaname")
-                if player and player.get("personaname")
-                else await get_nickname_from_xml(sid)
-            )
+            cursor = conn.cursor()
 
-            if not curr_nick:
-                continue
+            for sid, old_name in rows:
 
-            curr_nick = str(curr_nick).strip()
+                player = p_dict.get(sid)
 
-            conn = get_db()
+                if not player:
+                    continue
 
-            try:
+                curr = player.get("personaname")
 
-                cursor = conn.cursor()
+                if not curr:
+                    continue
 
-                history = get_history_list(cursor, sid)
+                curr = curr.strip()
 
-                if history and history[-1] == curr_nick:
+                if curr == old_name:
                     continue
 
                 cursor.execute("""
                     UPDATE users
-                    SET
-                        current_name = ?,
+                    SET current_name = ?,
                         updated_at = ?
                     WHERE steam_id = ?
                 """, (
-                    curr_nick,
+                    curr,
                     datetime.now().isoformat(),
                     sid
                 ))
 
-                cursor.execute("""
-                    INSERT INTO nickname_history (
-                        steam_id,
-                        nickname,
-                        changed_at
-                    )
-                    VALUES (?, ?, ?)
-                """, (
+                add_history_if_needed(
+                    cursor,
                     sid,
-                    curr_nick,
-                    datetime.now().isoformat()
-                ))
+                    curr
+                )
 
-                conn.commit()
+                print(f"[주기 닉변] {old_name} → {curr}")
 
-                history.append(curr_nick)
+            conn.commit()
 
-            finally:
-                conn.close()
-
-            if monitored != 1:
-                continue
-
-            embed = create_status_embed(
-                name_key,
-                sid,
-                history,
-                "notify",
-                player
-            )
-
-            for ch_id in notify_channels:
-
-                try:
-
-                    ch = self.get_channel(ch_id)
-
-                    if not ch:
-                        ch = await self.fetch_channel(ch_id)
-
-                    if ch:
-                        await ch.send(embed=embed)
-
-                except Exception as e:
-                    print(f"[채널 전송 오류] {e}")
+        finally:
+            conn.close()
 
 bot = MyBot()
 
 # =========================
-# 채널 제한
+# 채널 체크
 # =========================
 
 async def check_admin_channel(interaction):
@@ -634,10 +700,10 @@ async def check_admin_channel(interaction):
 # /추가
 # =========================
 
-@bot.tree.command(name="추가", description="유저 감시 등록")
+@bot.tree.command(name="추가", description="알림 감시 활성화")
 async def add_user(
     i: discord.Interaction,
-    steam_id: str,
+    target: str,
     별명: str = None
 ):
 
@@ -652,159 +718,122 @@ async def add_user(
 
         cursor = conn.cursor()
 
+        if 별명:
+
+            cursor.execute("""
+                SELECT steam_id
+                FROM users
+                WHERE name_key = ?
+            """, (별명,))
+
+            dup_name = cursor.fetchone()
+
+            if dup_name:
+
+                return await i.followup.send(
+                    f"❌ 이미 사용중인 별명입니다
+
+"
+                    f"등록 별명: {별명}
+"
+                    f"SteamID: {dup_name[0]}"
+                )
+
         cursor.execute("""
             SELECT
                 name_key,
                 current_name,
+                steam_id,
                 is_monitored
             FROM users
             WHERE steam_id = ?
-        """, (steam_id,))
+            OR name_key = ?
+        """, (
+            target,
+            target
+        ))
 
         row = cursor.fetchone()
 
-        if row:
-
-            name_key, current_name, monitored = row
+        if not row:
 
             return await i.followup.send(
-                f"❌ 이미 등록된 SteamID\n\n"
-                f"등록 별명: {name_key}\n"
-                f"현재 닉네임: {current_name}\n"
-                f"SteamID: {steam_id}"
+                "❌ SAV에서 아직 발견되지 않은 유저입니다"
             )
 
-        players = await get_steam_users_info([steam_id])
+        name_key, current_name, sid, monitored = row
 
-        player = players[0] if players else None
-
-        curr = (
-            player.get("personaname")
-            if player and player.get("personaname")
-            else await get_nickname_from_xml(steam_id)
-        )
-
-        if not curr:
+        if monitored == 1:
 
             return await i.followup.send(
-                "❌ 유효하지 않은 SteamID"
+                f"❌ 이미 감시중인 SteamID입니다
+
+"
+                f"등록 별명: {name_key}
+"
+                f"최근 닉네임: {current_name}
+"
+                f"SteamID: {sid}"
             )
 
-        save_name = (
+        new_name = (
             별명.strip()
             if 별명
-            else f"user_{steam_id[-6:]}"
+            else name_key or f"user_{sid[-6:]}"
         )
 
         cursor.execute("""
-            SELECT steam_id
-            FROM users
-            WHERE name_key = ?
-        """, (save_name,))
-
-        existing_name = cursor.fetchone()
-
-        if existing_name:
-
-            return await i.followup.send(
-                f"❌ 이미 사용 중인 별명입니다.\n\n"
-                f"등록 별명: {save_name}\n"
-                f"SteamID: {existing_name[0]}"
-            )
-
-        cursor.execute("""
-            INSERT INTO users (
-                steam_id,
-                name_key,
-                current_name,
-                is_monitored,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?)
+            UPDATE users
+            SET
+                is_monitored = 1,
+                name_key = ?
+            WHERE steam_id = ?
         """, (
-            steam_id,
-            save_name,
-            curr,
-            1,
-            datetime.now().isoformat()
-        ))
-
-        cursor.execute("""
-            INSERT INTO nickname_history (
-                steam_id,
-                nickname,
-                changed_at
-            )
-            VALUES (?, ?, ?)
-        """, (
-            steam_id,
-            curr,
-            datetime.now().isoformat()
+            new_name,
+            sid
         ))
 
         conn.commit()
 
-        await i.followup.send(
-            f"✅ 감시 등록 완료\n\n"
-            f"등록 별명: {save_name}\n"
-            f"현재 닉네임: {curr}\n"
-            f"SteamID: {steam_id}"
-        )
+        history = get_history_list(cursor, sid)
 
     finally:
         conn.close()
 
+    players = await get_steam_users_info([sid])
+
+    player = players[0] if players else None
+
+    embed = create_status_embed(
+        new_name,
+        sid,
+        history,
+        "add",
+        player
+    )
+
+    embed.add_field(
+        name="감시 상태",
+        value="🔔 알림 활성화",
+        inline=False
+    )
+
+    await i.followup.send(embed=embed)
+
 # =========================
-# /동기화
+# /삭제
 # =========================
 
-@bot.tree.command(
-    name="동기화",
-    description=".sav 업로드"
-)
-async def sync_sav_file(
+@bot.tree.command(name="삭제", description="알림 감시 해제")
+async def delete_user(
     i: discord.Interaction,
-    file: discord.Attachment
+    target: str
 ):
 
     if not await check_admin_channel(i):
         return
 
-    if not file.filename.endswith(".sav"):
-
-        return await i.response.send_message(
-            "❌ .sav 파일만 가능",
-            ephemeral=True
-        )
-
     await i.response.defer()
-
-    file_bytes = await file.read()
-
-    parsed = await asyncio.to_thread(
-        parse_sav_file,
-        file_bytes
-    )
-
-    if not parsed:
-
-        return await i.followup.send(
-            "❌ SteamID 발견 실패"
-        )
-
-    steam_ids = [
-        p["steam_id"]
-        for p in parsed
-    ]
-
-    players = await get_steam_users_info(steam_ids)
-
-    p_dict = {
-        p["steamid"]: p
-        for p in players
-    }
-
-    added = 0
 
     conn = get_db()
 
@@ -812,82 +841,41 @@ async def sync_sav_file(
 
         cursor = conn.cursor()
 
-        for item in parsed:
+        cursor.execute("""
+            SELECT
+                steam_id,
+                current_name,
+                name_key,
+                is_monitored
+            FROM users
+            WHERE steam_id = ?
+            OR name_key = ?
+        """, (
+            target,
+            target
+        ))
 
-            sid = item["steam_id"]
-            eos = item["eos_id"]
+        row = cursor.fetchone()
 
-            cursor.execute("""
-                SELECT 1
-                FROM users
-                WHERE steam_id = ?
-            """, (sid,))
+        if not row:
 
-            if cursor.fetchone():
-                continue
-
-            player = p_dict.get(sid)
-
-            curr = (
-                player.get("personaname")
-                if player
-                else f"Unknown_{sid[-4:]}"
+            return await i.followup.send(
+                "❌ 유저 없음"
             )
 
-            save_name = f"user_{sid[-6:]}"
+        sid, current_name, name_key, monitored = row
 
-            temp_name = save_name
-            count = 1
+        if monitored == 0:
 
-            while True:
+            return await i.followup.send(
+                "❌ 이미 감시 해제 상태"
+            )
 
-                cursor.execute("""
-                    SELECT 1
-                    FROM users
-                    WHERE name_key = ?
-                """, (temp_name,))
-
-                if not cursor.fetchone():
-                    break
-
-                temp_name = f"{save_name}_{count}"
-                count += 1
-
-            save_name = temp_name
-
-            cursor.execute("""
-                INSERT INTO users (
-                    steam_id,
-                    name_key,
-                    current_name,
-                    eos_id,
-                    is_monitored,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                sid,
-                save_name,
-                curr,
-                eos,
-                0,
-                datetime.now().isoformat()
-            ))
-
-            cursor.execute("""
-                INSERT INTO nickname_history (
-                    steam_id,
-                    nickname,
-                    changed_at
-                )
-                VALUES (?, ?, ?)
-            """, (
-                sid,
-                curr,
-                datetime.now().isoformat()
-            ))
-
-            added += 1
+        cursor.execute("""
+            UPDATE users
+            SET is_monitored = 0
+            WHERE steam_id = ?
+        """, (sid,))
 
         conn.commit()
 
@@ -895,84 +883,15 @@ async def sync_sav_file(
         conn.close()
 
     await i.followup.send(
-        f"✅ 동기화 완료\n새 유저 {added}명 저장"
+        f"✅ 감시 해제 완료
+
+"
+        f"등록 별명: {name_key}
+"
+        f"최근 닉네임: {current_name}
+"
+        f"SteamID: {sid}"
     )
-
-# =========================
-# /현황
-# =========================
-
-@bot.tree.command(
-    name="현황",
-    description="전체 리스트"
-)
-async def status_list(i: discord.Interaction):
-
-    if not await check_admin_channel(i):
-        return
-
-    await i.response.defer()
-
-    conn = get_db()
-
-    try:
-
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            SELECT
-                name_key,
-                steam_id,
-                current_name,
-                is_monitored
-            FROM users
-            ORDER BY updated_at DESC
-        """)
-
-        rows = cursor.fetchall()
-
-    finally:
-        conn.close()
-
-    if not rows:
-        return await i.followup.send("📊 저장된 유저 없음")
-
-    messages = []
-
-    current_msg = (
-        "📊 전체 현황\n"
-        "```text\n"
-        "상태 / 저장별명 / 현재닉 / SteamID\n"
-    )
-
-    for name, sid, current_name, monitored in rows:
-
-        icon = "🔔" if monitored else "🔇"
-
-        line = f"{icon} / {name} / {current_name} / {sid}\n"
-
-        if len(current_msg + line + "```") > 1900:
-
-            current_msg += "```"
-            messages.append(current_msg)
-
-            current_msg = (
-                "```text\n"
-                f"{line}"
-            )
-
-        else:
-            current_msg += line
-
-    current_msg += "```"
-    messages.append(current_msg)
-
-    for idx, msg in enumerate(messages):
-
-        if idx == 0:
-            await i.followup.send(msg)
-        else:
-            await i.channel.send(msg)
 
 # =========================
 # /내역
@@ -1001,7 +920,10 @@ async def user_history(
         cursor.execute("""
             SELECT
                 name_key,
-                steam_id
+                steam_id,
+                current_name,
+                updated_at,
+                is_monitored
             FROM users
             WHERE steam_id = ?
             OR name_key = ?
@@ -1018,7 +940,7 @@ async def user_history(
                 "❌ 유저 없음"
             )
 
-        name, sid = row
+        name_key, sid, current_name, updated_at, monitored = row
 
         history = get_history_list(cursor, sid)
 
@@ -1029,28 +951,43 @@ async def user_history(
 
     player = players[0] if players else None
 
-    await i.followup.send(
-        embed=create_status_embed(
-            name,
-            sid,
-            history,
-            "history",
-            player
-        )
+    embed = create_status_embed(
+        name_key,
+        sid,
+        history,
+        "history",
+        player
     )
 
+    embed.add_field(
+        name="감시 상태",
+        value="🔔 감시중" if monitored else "🔇 미감시",
+        inline=False
+    )
+
+    embed.add_field(
+        name="최근 갱신",
+        value=updated_at or "없음",
+        inline=False
+    )
+
+    embed.add_field(
+        name="닉변 횟수",
+        value=str(max(0, len(history)-1)),
+        inline=False
+    )
+
+    await i.followup.send(embed=embed)
+
 # =========================
-# /삭제
+# /현황
 # =========================
 
 @bot.tree.command(
-    name="삭제",
-    description="유저 삭제"
+    name="현황",
+    description="현재 감시중인 유저 목록"
 )
-async def delete_user(
-    i: discord.Interaction,
-    target: str
-):
+async def status_list(i: discord.Interaction):
 
     if not await check_admin_channel(i):
         return
@@ -1066,45 +1003,61 @@ async def delete_user(
         cursor.execute("""
             SELECT
                 name_key,
-                steam_id
+                steam_id,
+                current_name
             FROM users
-            WHERE steam_id = ?
-            OR name_key = ?
-        """, (
-            target,
-            target
-        ))
+            WHERE is_monitored = 1
+            ORDER BY updated_at DESC
+        """)
 
-        row = cursor.fetchone()
-
-        if not row:
-
-            return await i.followup.send(
-                "❌ 찾을 수 없는 유저"
-            )
-
-        name_key, steam_id = row
-
-        cursor.execute("""
-            DELETE FROM users
-            WHERE steam_id = ?
-        """, (steam_id,))
-
-        cursor.execute("""
-            DELETE FROM nickname_history
-            WHERE steam_id = ?
-        """, (steam_id,))
-
-        conn.commit()
+        rows = cursor.fetchall()
 
     finally:
         conn.close()
 
-    await i.followup.send(
-        f"✅ 삭제 완료\n\n"
-        f"삭제된 별명: {name_key}\n"
-        f"SteamID: {steam_id}"
+    if not rows:
+
+        return await i.followup.send(
+            "📭 현재 감시중인 유저 없음"
+        )
+
+    messages = []
+
+    current_msg = (
+        "📡 현재 감시중인 유저 목록
+"
+        "```text
+"
+        "별명 / 현재닉 / SteamID
+"
     )
+
+    for name, sid, current_name in rows:
+
+        line = f"{name} / {current_name} / {sid}
+"
+
+        if len(current_msg + line + "```") > 1900:
+
+            current_msg += "```"
+            messages.append(current_msg)
+
+            current_msg = "```text
+"
+            current_msg += line
+
+        else:
+            current_msg += line
+
+    current_msg += "```"
+    messages.append(current_msg)
+
+    for idx, msg in enumerate(messages):
+
+        if idx == 0:
+            await i.followup.send(msg)
+        else:
+            await i.channel.send(msg)
 
 # =========================
 # /채널설정
@@ -1112,18 +1065,12 @@ async def delete_user(
 
 @bot.tree.command(
     name="채널설정",
-    description="알림 채널 설정"
+    description="관리/알림 채널 설정"
 )
 @app_commands.choices(
     역할=[
-        app_commands.Choice(
-            name="관리",
-            value="admin"
-        ),
-        app_commands.Choice(
-            name="알림",
-            value="notify"
-        )
+        app_commands.Choice(name="관리", value="admin"),
+        app_commands.Choice(name="알림", value="notify")
     ]
 )
 async def set_channel(
@@ -1177,8 +1124,35 @@ async def set_channel(
     )
 
 # =========================
+# 초기 전체 SAV 스캔
+# =========================
+
+async def initial_scan():
+
+    print("[초기 SAV 전체 스캔 시작]")
+
+    watcher = SavWatcher(bot)
+
+    for filename in WATCH_FILES:
+
+        path = os.path.join(SAVE_DIR, filename)
+
+        if os.path.exists(path):
+
+            await watcher.process_file(path)
+
+    print("[초기 SAV 전체 스캔 완료]")
+
+# =========================
 # 실행
 # =========================
 
 if __name__ == "__main__":
+
+    async def runner():
+        await initial_scan()
+
+    bot.loop.create_task(runner())
+
     bot.run(TOKEN)
+````
