@@ -72,6 +72,7 @@ def init_db():
 
         cursor = conn.cursor()
 
+        # users
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 steam_id TEXT PRIMARY KEY,
@@ -79,11 +80,13 @@ def init_db():
             )
         """)
 
+        ensure_column(cursor, "users", "history", "TEXT")
         ensure_column(cursor, "users", "current_name", "TEXT")
         ensure_column(cursor, "users", "eos_id", "TEXT")
-        ensure_column(cursor, "users", "is_monitored", "INTEGER DEFAULT 0")
+        ensure_column(cursor, "users", "is_monitored", "INTEGER DEFAULT 1")
         ensure_column(cursor, "users", "updated_at", "TEXT")
 
+        # channels
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 guild_id TEXT PRIMARY KEY,
@@ -92,6 +95,7 @@ def init_db():
             )
         """)
 
+        # nickname history
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS nickname_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +104,77 @@ def init_db():
                 changed_at TEXT NOT NULL
             )
         """)
+
+        ensure_column(
+            cursor,
+            "nickname_history",
+            "changed_at",
+            "TEXT"
+        )
+
+        # =========================
+        # 기존 history 복구
+        # =========================
+
+        cursor.execute("""
+            SELECT steam_id, history, current_name
+            FROM users
+        """)
+
+        rows = cursor.fetchall()
+
+        for sid, history_text, current_name in rows:
+
+            if not history_text:
+                continue
+
+            nicknames = [
+                x.strip()
+                for x in history_text.split("|")
+                if x.strip()
+            ]
+
+            for nick in nicknames:
+
+                cursor.execute("""
+                    INSERT INTO nickname_history (
+                        steam_id,
+                        nickname,
+                        changed_at
+                    )
+                    SELECT ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM nickname_history
+                        WHERE steam_id = ?
+                        AND nickname = ?
+                    )
+                """, (
+                    sid,
+                    nick,
+                    datetime.now().isoformat(),
+                    sid,
+                    nick
+                ))
+
+            # current_name 복구
+            if not current_name and nicknames:
+
+                cursor.execute("""
+                    UPDATE users
+                    SET current_name = ?
+                    WHERE steam_id = ?
+                """, (
+                    nicknames[-1],
+                    sid
+                ))
+
+            # 감시 상태 자동 ON
+            cursor.execute("""
+                UPDATE users
+                SET is_monitored = 1
+                WHERE steam_id = ?
+            """, (sid,))
 
         conn.commit()
 
@@ -117,7 +192,6 @@ def chunked(lst, size):
 
     for i in range(0, len(lst), size):
         yield lst[i:i + size]
-
 
 # =========================
 # Steam API
