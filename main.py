@@ -1,5 +1,5 @@
 # 수정된 전체 코드 (오류 수정 완료 버전)
-```python id="exjlwm"
+```python
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
