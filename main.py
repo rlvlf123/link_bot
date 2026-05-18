@@ -69,6 +69,47 @@ def init_db():
             )
         """)
 
+        # =========================
+        # 컬럼 자동 복구
+        # =========================
+
+        cursor.execute("PRAGMA table_info(users)")
+
+        cols = [
+            c[1]
+            for c in cursor.fetchall()
+        ]
+
+        alter_queries = []
+
+        if "current_name" not in cols:
+            alter_queries.append(
+                "ALTER TABLE users ADD COLUMN current_name TEXT"
+            )
+
+        if "eos_id" not in cols:
+            alter_queries.append(
+                "ALTER TABLE users ADD COLUMN eos_id TEXT"
+            )
+
+        if "updated_at" not in cols:
+            alter_queries.append(
+                "ALTER TABLE users ADD COLUMN updated_at TEXT"
+            )
+
+        if "is_monitored" not in cols:
+            alter_queries.append(
+                "ALTER TABLE users ADD COLUMN is_monitored INTEGER DEFAULT 0"
+            )
+
+        for q in alter_queries:
+
+            try:
+                cursor.execute(q)
+
+            except Exception as e:
+                print(f"[ALTER 오류] {e}")
+
         conn.commit()
 
     finally:
