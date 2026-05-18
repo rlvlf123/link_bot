@@ -932,6 +932,42 @@ async def set_channel(
         f"✅ {역할} 채널 설정 완료"
     )
 
+@bot.tree.command(
+    name="전체감시활성화",
+    description="기존 유저 전체 감시 활성화"
+)
+async def enable_all_monitor(i: discord.Interaction):
+
+    if not i.user.guild_permissions.administrator:
+        return await i.response.send_message(
+            "❌ 관리자 권한 필요",
+            ephemeral=True
+        )
+
+    await i.response.defer()
+
+    def update_all():
+
+        conn = get_db()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "UPDATE users SET is_monitored = 1"
+        )
+
+        conn.commit()
+
+        updated_count = cursor.rowcount
+
+        conn.close()
+
+        return updated_count
+
+    updated_count = await asyncio.to_thread(update_all)
+
+    await i.followup.send(
+        f"✅ 기존 유저 {updated_count}명 감시 활성화 완료"
+    )
 # =========================
 # 실행
 # =========================
