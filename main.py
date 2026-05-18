@@ -63,7 +63,7 @@ async def get_steam_users_info(steam_ids):
     if not steam_ids: 
         return []
     ids_str = ",".join(steam_ids)
-    url = f"[http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=](http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=){STEAM_API_KEY}&steamids={ids_str}"
+    url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={ids_str}"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=10)
         if res.status_code == 200:
@@ -73,7 +73,7 @@ async def get_steam_users_info(steam_ids):
     return []
 
 async def get_nickname_from_xml(steam_id):
-    url = f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/?xml=1"
+    url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=8)
         if res.status_code == 200:
@@ -325,22 +325,24 @@ async def status_list(i: discord.Interaction):
         return await i.followup.send("📊 저장된 유저가 없습니다.")
     
     pages = []
-    # 💡 에러 원인이었던 코드 조각을 아래처럼 명확히 감싸서 수정했습니다.
-    current_page = "📊 **전체 조우 현황 (🔔=감시중 / 🔇=기록만)**\n```text\n상태 / 별명 / 현재닉네임 / SteamID\n"
+    
+    # 💡 절대로 깨지지 않게 멀티라인 삼중 따옴표(""") 구조로 텍스트를 전면 결합화했습니다.
+    header = """📊 **전체 조우 현황 (🔔=감시중 / 🔇=기록만)**\n```text\n상태 / 별명 / 현재닉네임 / SteamID\n"""
+    current_page = header
     
     for name, sid, hist, is_monitored in rows:
         last = hist.split(" | ")[-1] if hist else "없음"
         status_icon = "🔔" if is_monitored == 1 else "🔇"
         line = f"{status_icon} / {name} / {last} / {sid}\n"
+        
         if len(current_page + line) > 1900:
             pages.append(current_page + "```")
-            current_page = "
-```text\n" + line
+            current_page = "```text\n" + line
         else:
             current_page += line
             
-    # 💡 이 부분이 완벽하게 닫히도록 마크다운 기호를 쌍따옴표 안에 온전히 채웠습니다.
-    pages.append(current_page + "```")
+    pages.append(current_page + "
+```")
 
     await i.followup.send(pages[0])
     for page in pages[1:]:
