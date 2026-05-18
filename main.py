@@ -157,6 +157,25 @@ def get_history_list(cursor, steam_id):
 
 init_db()
 repair_current_names()
+def enable_all_monitored():
+
+    conn = get_db()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            UPDATE users
+            SET is_monitored = 1
+        """)
+
+        conn.commit()
+
+        print("[DB] 모든 유저 감시 활성화 완료")
+
+    finally:
+        conn.close()
 enable_all_monitored()
 
 # =========================
