@@ -1,6 +1,5 @@
 # 수정된 전체 코드 (핵심 통합 버전)
 
-````python
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
