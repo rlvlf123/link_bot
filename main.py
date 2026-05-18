@@ -1,4 +1,3 @@
-python
 # 수정된 전체 코드 (오류 수정 완료 버전)
 
 import discord
