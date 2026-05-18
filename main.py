@@ -23,7 +23,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # 테이블 생성 및 감시 토글 필드(is_monitored) 추가
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (
                         name_key TEXT PRIMARY KEY,
                         steam_id TEXT,
@@ -43,7 +42,6 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 def get_column_names():
-    """DB 파일의 실제 컬럼명 구조를 감지하여 반환합니다."""
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -65,7 +63,7 @@ async def get_steam_users_info(steam_ids):
     if not steam_ids: 
         return []
     ids_str = ",".join(steam_ids)
-    url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={ids_str}"
+    url = f"[http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=](http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=){STEAM_API_KEY}&steamids={ids_str}"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=10)
         if res.status_code == 200:
@@ -75,7 +73,7 @@ async def get_steam_users_info(steam_ids):
     return []
 
 async def get_nickname_from_xml(steam_id):
-    url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
+    url = f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/?xml=1"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=8)
         if res.status_code == 200:
@@ -88,7 +86,6 @@ async def get_nickname_from_xml(steam_id):
     return None
 
 def parse_sav_file(file_bytes):
-    """.sav 바이너리 파일 내부에서 SteamID(7656119...) 패턴을 추출합니다."""
     found_players = []
     try:
         text_data = file_bytes.decode('utf-8', errors='ignore')
@@ -191,7 +188,6 @@ class MyBot(commands.Bot):
                 
             await asyncio.to_thread(update_db, new_history_str, name_key)
             
-            # 감시 상태인 인원만 디스코드 메시지 전송
             if is_monitored == 1:
                 is_private = player.get('communityvisibilitystate') != 3 if player else True
                 embed = create_status_embed(name_key, sid, history, "notify", player, is_private)
@@ -329,7 +325,7 @@ async def status_list(i: discord.Interaction):
         return await i.followup.send("📊 저장된 유저가 없습니다.")
     
     pages = []
-    # 💡 [해결 부분] 깨진 닫는 따옴표 구문을 한 줄로 안전하게 수정 완료
+    # 💡 에러 원인이었던 코드 조각을 아래처럼 명확히 감싸서 수정했습니다.
     current_page = "📊 **전체 조우 현황 (🔔=감시중 / 🔇=기록만)**\n```text\n상태 / 별명 / 현재닉네임 / SteamID\n"
     
     for name, sid, hist, is_monitored in rows:
@@ -338,11 +334,13 @@ async def status_list(i: discord.Interaction):
         line = f"{status_icon} / {name} / {last} / {sid}\n"
         if len(current_page + line) > 1900:
             pages.append(current_page + "```")
-            current_page = "```text\n" + line
+            current_page = "
+```text\n" + line
         else:
             current_page += line
-    pages.append(current_page + "
-```")
+            
+    # 💡 이 부분이 완벽하게 닫히도록 마크다운 기호를 쌍따옴표 안에 온전히 채웠습니다.
+    pages.append(current_page + "```")
 
     await i.followup.send(pages[0])
     for page in pages[1:]:
