@@ -39,7 +39,7 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             steam_id TEXT PRIMARY KEY,
-            name_key TEXT,
+            name_key TEXT UNIQUE,
             current_name TEXT,
             history TEXT,
             eos_id TEXT,
@@ -55,37 +55,6 @@ def init_db():
             notify_id INTEGER
         )
     """)
-
-    cursor.execute("PRAGMA table_info(users)")
-    cols = [c[1] for c in cursor.fetchall()]
-
-    alter_queries = []
-
-    if "current_name" not in cols:
-        alter_queries.append(
-            "ALTER TABLE users ADD COLUMN current_name TEXT"
-        )
-
-    if "eos_id" not in cols:
-        alter_queries.append(
-            "ALTER TABLE users ADD COLUMN eos_id TEXT"
-        )
-
-    if "updated_at" not in cols:
-        alter_queries.append(
-            "ALTER TABLE users ADD COLUMN updated_at TEXT"
-        )
-
-    if "is_monitored" not in cols:
-        alter_queries.append(
-            "ALTER TABLE users ADD COLUMN is_monitored INTEGER DEFAULT 0"
-        )
-
-    for q in alter_queries:
-        try:
-            cursor.execute(q)
-        except:
-            pass
 
     conn.commit()
     conn.close()
@@ -484,11 +453,12 @@ bot = MyBot()
 
 @bot.tree.command(
     name="추가",
-    description="감시 활성화"
+    description="유저 감시 등록"
 )
 async def add_user(
     i: discord.Interaction,
-    steam_id: str
+    steam_id: str,
+    별명: str = None
 ):
 
     await i.response.defer()
@@ -499,6 +469,7 @@ async def add_user(
     cursor.execute("""
         SELECT
             name_key,
+            current_name,
             history,
             is_monitored
         FROM users
@@ -509,14 +480,16 @@ async def add_user(
 
     if row:
 
-        name_key, history_str, monitored = row
+        name_key, current_name, history_str, monitored = row
 
         if monitored == 1:
 
             conn.close()
 
             return await i.followup.send(
-                "❌ 이미 감시 중인 유저"
+                f"❌ 이미 등록된 SteamID\n\n"
+                f"등록 별명: {name_key}\n"
+                f"현재 닉네임: {current_name}"
             )
 
         cursor.execute("""
@@ -542,8 +515,6 @@ async def add_user(
             )
         )
 
-    conn.close()
-
     players = await get_steam_users_info([steam_id])
 
     player = players[0] if players else None
@@ -555,12 +526,36 @@ async def add_user(
     )
 
     if not curr:
+
+        conn.close()
+
         return await i.followup.send(
             "❌ 유효하지 않은 SteamID"
         )
 
-    conn = get_db()
-    cursor = conn.cursor()
+    save_name = (
+        별명.strip()
+        if 별명
+        else curr.strip()
+    )
+
+    cursor.execute("""
+        SELECT steam_id
+        FROM users
+        WHERE name_key = ?
+    """, (save_name,))
+
+    existing_name = cursor.fetchone()
+
+    if existing_name:
+
+        conn.close()
+
+        return await i.followup.send(
+            f"❌ 이미 사용 중인 별명입니다.\n\n"
+            f"등록 별명: {save_name}\n"
+            f"SteamID: {existing_name[0]}"
+        )
 
     cursor.execute("""
         INSERT INTO users (
@@ -574,7 +569,7 @@ async def add_user(
         VALUES (?, ?, ?, ?, ?, ?)
     """, (
         steam_id,
-        curr,
+        save_name,
         curr,
         curr,
         1,
@@ -585,13 +580,10 @@ async def add_user(
     conn.close()
 
     await i.followup.send(
-        embed=create_status_embed(
-            curr,
-            steam_id,
-            [curr],
-            "add",
-            player
-        )
+        f"✅ 감시 등록 완료\n\n"
+        f"등록 별명: {save_name}\n"
+        f"현재 닉네임: {curr}\n"
+        f"SteamID: {steam_id}"
     )
 
 # =========================
@@ -667,6 +659,23 @@ async def sync_sav_file(
             if player
             else f"Unknown_{sid[-4:]}"
         )
+
+        base_name = curr
+        suffix = 1
+
+        while True:
+
+            cursor.execute("""
+                SELECT 1
+                FROM users
+                WHERE name_key = ?
+            """, (curr,))
+
+            if not cursor.fetchone():
+                break
+
+            curr = f"{base_name}_{suffix}"
+            suffix += 1
 
         cursor.execute("""
             INSERT INTO users (
@@ -849,7 +858,10 @@ async def delete_user(
     cursor = conn.cursor()
 
     cursor.execute("""
-        DELETE FROM users
+        SELECT
+            name_key,
+            steam_id
+        FROM users
         WHERE steam_id = ?
         OR name_key = ?
     """, (
@@ -857,15 +869,31 @@ async def delete_user(
         target
     ))
 
-    deleted = cursor.rowcount
+    row = cursor.fetchone()
+
+    if not row:
+
+        conn.close()
+
+        return await i.followup.send(
+            "❌ 찾을 수 없는 유저"
+        )
+
+    name_key, steam_id = row
+
+    cursor.execute("""
+        DELETE FROM users
+        WHERE steam_id = ?
+    """, (steam_id,))
 
     conn.commit()
     conn.close()
 
-    if deleted > 0:
-        await i.followup.send("✅ 삭제 완료")
-    else:
-        await i.followup.send("❌ 찾을 수 없음")
+    await i.followup.send(
+        f"✅ 삭제 완료\n\n"
+        f"삭제된 별명: {name_key}\n"
+        f"SteamID: {steam_id}"
+    )
 
 # =========================
 # /채널설정
@@ -968,6 +996,7 @@ async def enable_all_monitor(i: discord.Interaction):
     await i.followup.send(
         f"✅ 기존 유저 {updated_count}명 감시 활성화 완료"
     )
+
 # =========================
 # 실행
 # =========================
