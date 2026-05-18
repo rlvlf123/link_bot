@@ -36,7 +36,6 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
 
-    # 기존 users 테이블 생성
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             steam_id TEXT PRIMARY KEY,
@@ -49,7 +48,6 @@ def init_db():
         )
     """)
 
-    # channels 테이블 생성
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS channels (
             guild_id TEXT PRIMARY KEY,
@@ -57,8 +55,6 @@ def init_db():
             notify_id INTEGER
         )
     """)
-
-    # ===== 컬럼 자동 추가 =====
 
     cursor.execute("PRAGMA table_info(users)")
     cols = [c[1] for c in cursor.fetchall()]
@@ -94,7 +90,29 @@ def init_db():
     conn.commit()
     conn.close()
 
+def repair_current_names():
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    try:
+
+        cursor.execute("""
+            UPDATE users
+            SET current_name = name_key
+            WHERE current_name IS NULL
+            OR current_name = ''
+        """)
+
+        conn.commit()
+
+    except Exception as e:
+        print(f"[DB 복구 오류] {e}")
+
+    conn.close()
+
 init_db()
+repair_current_names()
 
 # =========================
 # Steam API
@@ -114,6 +132,7 @@ async def get_steam_users_info(steam_ids):
     )
 
     try:
+
         res = await asyncio.to_thread(
             requests.get,
             url,
@@ -121,7 +140,13 @@ async def get_steam_users_info(steam_ids):
         )
 
         if res.status_code == 200:
-            return res.json().get("response", {}).get("players", [])
+            return res.json().get(
+                "response",
+                {}
+            ).get(
+                "players",
+                []
+            )
 
     except Exception as e:
         print(f"[Steam API 오류] {e}")
@@ -133,6 +158,7 @@ async def get_nickname_from_xml(steam_id):
     url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
 
     try:
+
         res = await asyncio.to_thread(
             requests.get,
             url,
@@ -198,7 +224,7 @@ def parse_sav_file(file_bytes):
     return results
 
 # =========================
-# Embed
+# EMBED
 # =========================
 
 def create_status_embed(
@@ -235,7 +261,7 @@ def create_status_embed(
             url=player.get("avatarfull")
         )
 
-        state_map = {
+        status_map = {
             0: "🔴 오프라인",
             1: "🟢 온라인",
             2: "⛔ 바쁨",
@@ -243,9 +269,9 @@ def create_status_embed(
             4: "💤 취침 중"
         }
 
-        state = state_map.get(
+        state = status_map.get(
             player.get("personastate", 0),
-            "❓ 알 수 없음"
+            "❓ 정보 없음"
         )
 
         if is_private:
@@ -262,7 +288,7 @@ def create_status_embed(
 
     embed.add_field(
         name="등록 별명",
-        value=display_name,
+        value=display_name or "없음",
         inline=True
     )
 
@@ -669,8 +695,7 @@ async def sync_sav_file(
     conn.close()
 
     await i.followup.send(
-        f"✅ 동기화 완료\n"
-        f"새 유저 {added}명 저장"
+        f"✅ 동기화 완료\n새 유저 {added}명 저장"
     )
 
 # =========================
@@ -716,6 +741,8 @@ async def status_list(i: discord.Interaction):
     for name, sid, current_name, monitored in rows:
 
         icon = "🔔" if monitored == 1 else "🔇"
+
+        current_name = current_name or name
 
         line = f"{icon} / {name} / {current_name} / {sid}\n"
 
