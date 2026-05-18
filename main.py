@@ -157,6 +157,69 @@ def get_history_list(cursor, steam_id):
 
 init_db()
 repair_current_names()
+def migrate_old_history():
+
+    conn = get_db()
+
+    try:
+
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT steam_id, history
+            FROM users
+            WHERE history IS NOT NULL
+            AND history != ''
+        """)
+
+        rows = cursor.fetchall()
+
+        migrated = 0
+
+        for sid, history_str in rows:
+
+            history_list = history_str.split(" | ")
+
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM nickname_history
+                WHERE steam_id = ?
+            """, (sid,))
+
+            already_count = cursor.fetchone()[0]
+
+            if already_count > 0:
+                continue
+
+            for nick in history_list:
+
+                nick = nick.strip()
+
+                if not nick:
+                    continue
+
+                cursor.execute("""
+                    INSERT INTO nickname_history (
+                        steam_id,
+                        nickname,
+                        changed_at
+                    )
+                    VALUES (?, ?, ?)
+                """, (
+                    sid,
+                    nick,
+                    datetime.now().isoformat()
+                ))
+
+            migrated += 1
+
+        conn.commit()
+
+        print(f"[DB] 히스토리 이전 완료: {migrated}명")
+
+    finally:
+        conn.close()
+        migrate_old_history()
 def enable_all_monitored():
 
     conn = get_db()
