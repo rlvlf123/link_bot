@@ -729,14 +729,11 @@ async def add_user(
 
             if dup_name:
 
-                return await i.followup.send(
-                    f"❌ 이미 사용중인 별명입니다
-
-"
-                    f"등록 별명: {별명}
-"
-                    f"SteamID: {dup_name[0]}"
-                )
+return await i.followup.send(
+    f"❌ 이미 사용중인 별명입니다\n\n"
+    f"등록 별명: {별명}\n"
+    f"SteamID: {dup_name[0]}"
+)
 
         cursor.execute("""
             SELECT
