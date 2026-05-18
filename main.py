@@ -105,17 +105,7 @@ def init_db():
             )
         """)
 
-        ensure_column(
-            cursor,
-            "nickname_history",
-            "changed_at",
-            "TEXT"
-        )
-
-        # =========================
         # 기존 history 복구
-        # =========================
-
         cursor.execute("""
             SELECT steam_id, history, current_name
             FROM users
@@ -169,7 +159,7 @@ def init_db():
                     sid
                 ))
 
-            # 감시 상태 자동 ON
+            # 감시 자동 ON
             cursor.execute("""
                 UPDATE users
                 SET is_monitored = 1
@@ -598,7 +588,7 @@ class MyBot(commands.Bot):
         if not self.scan_loop.is_running():
             self.scan_loop.start()
 
-    @tasks.loop(minutes=5)
+    @tasks.loop(seconds=30)
     async def scan_loop(self):
 
         async with self.scan_lock:
@@ -831,34 +821,102 @@ async def add_user(
 
         cursor = conn.cursor()
 
+        # 별명 중복 체크
         if 별명:
 
             cursor.execute("""
-                SELECT 1
+                SELECT
+                    steam_id,
+                    current_name,
+                    name_key
                 FROM users
                 WHERE name_key = ?
             """, (별명.strip(),))
 
-            if cursor.fetchone():
+            dup_name = cursor.fetchone()
+
+            if dup_name:
 
                 return await i.followup.send(
-                    "❌ 이미 사용중인 별명입니다"
+                    f"❌ 이미 사용중인 별명입니다\n\n"
+                    f"등록 별명: {dup_name[2]}\n"
+                    f"최근 닉네임: {dup_name[1]}\n"
+                    f"SteamID: {dup_name[0]}"
                 )
 
         row = find_user(cursor, target)
 
+        # DB 없으면 SteamID 직접 등록
         if not row:
 
-            return await i.followup.send(
-                "❌ SAV에서 아직 발견되지 않은 유저입니다"
+            if not target.isdigit():
+
+                return await i.followup.send(
+                    "❌ 존재하지 않는 유저입니다"
+                )
+
+            sid = target
+
+            players = await get_steam_users_info([sid])
+
+            player = players[0] if players else None
+
+            if not player:
+
+                return await i.followup.send(
+                    "❌ Steam 유저 조회 실패"
+                )
+
+            current_name = await get_current_nickname(
+                sid,
+                player
             )
 
-        sid, current_name, name_key, monitored = row
+            name_key = (
+                별명.strip()
+                if 별명
+                else f"user_{sid[-6:]}"
+            )
 
+            monitored = 0
+
+            cursor.execute("""
+                INSERT INTO users (
+                    steam_id,
+                    name_key,
+                    current_name,
+                    is_monitored,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                sid,
+                name_key,
+                current_name,
+                0,
+                datetime.now().isoformat()
+            ))
+
+            add_history_if_needed(
+                cursor,
+                sid,
+                current_name
+            )
+
+            conn.commit()
+
+        else:
+
+            sid, current_name, name_key, monitored = row
+
+        # 이미 감시중
         if monitored == 1:
 
             return await i.followup.send(
-                "❌ 이미 감시중인 유저입니다"
+                f"❌ 이미 감시중인 SteamID입니다\n\n"
+                f"등록 별명: {name_key}\n"
+                f"최근 닉네임: {current_name}\n"
+                f"SteamID: {sid}"
             )
 
         new_name = (
