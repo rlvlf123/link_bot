@@ -157,6 +157,7 @@ def get_history_list(cursor, steam_id):
 
 init_db()
 repair_current_names()
+enable_all_monitored()
 
 # =========================
 # Steam API
