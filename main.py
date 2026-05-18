@@ -54,8 +54,10 @@ def get_column_names():
         sid_col = "steam_id" if "steam_id" in cols else "STEAM_ID"
         hist_col = "history" if "history" in cols else "HISTORY"
         return name_col, sid_col, hist_col
-    except:
-        conn.close()
+    except Exception as e:
+        print(f"[DB 컬럼 확인 에러] {e}")
+        try: conn.close() 
+        except: pass
         return "name_key", "steam_id", "history"
 
 # --- [3. 유틸리티 ] ---
@@ -63,7 +65,7 @@ async def get_steam_users_info(steam_ids):
     if not steam_ids: 
         return []
     ids_str = ",".join(steam_ids)
-    url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={ids_str}"
+    url = f"[http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=](http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=){STEAM_API_KEY}&steamids={ids_str}"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=10)
         if res.status_code == 200:
@@ -73,7 +75,7 @@ async def get_steam_users_info(steam_ids):
     return []
 
 async def get_nickname_from_xml(steam_id):
-    url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
+    url = f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/?xml=1"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=8)
         if res.status_code == 200:
@@ -81,8 +83,10 @@ async def get_nickname_from_xml(steam_id):
             node = root.find('steamID')
             if node is not None: 
                 return node.text
+    except ET.ParseError:
+        print(f"[XML 파싱 에러] 올바르지 않은 XML 형식이거나 스팀 서버 점검 중입니다.")
     except Exception as e:
-        print(f"[XML 파싱 에러] {e}")
+        print(f"[XML 통신 에러] {e}")
     return None
 
 def create_status_embed(display_name, sid, history, mode="notify", player=None, is_private=False):
@@ -92,7 +96,8 @@ def create_status_embed(display_name, sid, history, mode="notify", player=None, 
     embed = discord.Embed(title=titles.get(mode, "알림"), color=colors.get(mode, discord.Color.light_grey()))
     
     if player:
-        embed.set_thumbnail(url=player.get('avatarfull'))
+        if player.get('avatarfull'):
+            embed.set_thumbnail(url=player.get('avatarfull'))
         status_map = {0: "🔴 오프라인", 1: "🟢 온라인", 2: "⛔ 바쁨", 3: "🌙 자리비움", 4: "💤 취침 중"}
         state = status_map.get(player.get('personastate', 0), "❓ 정보 없음")
         if is_private: 
@@ -130,7 +135,6 @@ class MyBot(commands.Bot):
 
     @tasks.loop(minutes=5.0)
     async def check_steam_nicknames(self):
-        # 1) DB 조회를 비동기 스레드 풀에서 실행 (블로킹 IO 방지)
         def fetch_and_update_users():
             name_col, sid_col, hist_col = get_column_names()
             conn = get_db()
@@ -139,13 +143,18 @@ class MyBot(commands.Bot):
             rows = cursor.fetchall()
             
             cursor.execute("SELECT notify_id FROM channels")
-            channels = [ch[0] for ch in cursor.fetchall() if ch[0]]
+            # 디스코드 채널 ID 조회를 위해 int 형변환 보장
+            channels = [int(ch[0]) for ch in cursor.fetchall() if ch[0]]
             
             conn.close()
             return rows, channels, (name_col, sid_col, hist_col)
 
-        rows, notify_channels, cols = await asyncio.to_thread(fetch_and_update_users)
-        name_col, sid_col, hist_col = cols
+        try:
+            rows, notify_channels, cols = await asyncio.to_thread(fetch_and_update_users)
+            name_col, sid_col, hist_col = cols
+        except Exception as e:
+            print(f"[루프 DB 조회 에러] {e}")
+            return
         
         if not rows: 
             return
@@ -165,14 +174,13 @@ class MyBot(commands.Bot):
                 continue
             if history and curr_nick == history[-1]: 
                 continue
-            # 💡 [복구 완료] 스팀 API 오동작 등으로 이전 닉네임이 임시 조회되었을 때 알림 폭탄 방지
+            # 스팀 API 오동작 등으로 이전 닉네임이 임시 조회되었을 때 알림 폭탄 방지
             if len(history) >= 2 and curr_nick == history[-2]: 
                 continue
 
             history.append(curr_nick)
             new_history_str = " | ".join(history)
             
-            # 2) DB 업데이트 처리를 비동기 스레드 풀에서 실행
             def update_db(h_str, n_key):
                 conn = get_db()
                 cursor = conn.cursor()
@@ -180,7 +188,11 @@ class MyBot(commands.Bot):
                 conn.commit()
                 conn.close()
                 
-            await asyncio.to_thread(update_db, new_history_str, name_key)
+            try:
+                await asyncio.to_thread(update_db, new_history_str, name_key)
+            except Exception as e:
+                print(f"[루프 DB 업데이트 에러] {e}")
+                continue
             
             # 알림 메시지 생성 및 전송
             is_private = player.get('communityvisibilitystate') != 3 if player else True
@@ -203,7 +215,6 @@ bot = MyBot()
 # --- [5. 명령어 구현] ---
 @bot.tree.command(name="추가", description="유저 추가 (별명 생략 시 스팀 닉네임으로 자동 등록)")
 async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
-    # ⚠️ 디스코드 인터랙션 3초 타임아웃 차단을 막기 위해 무조건 최상단에 배치
     await i.response.defer()
     
     name_col, sid_col, hist_col = await asyncio.to_thread(get_column_names)
@@ -266,7 +277,7 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
 
 @bot.tree.command(name="현황", description="전체 리스트 확인")
 async def status_list(i: discord.Interaction):
-    await i.response.defer() # 리스트 출력이 지연될 수 있으므로 유예 처리
+    await i.response.defer() 
     name_col, sid_col, hist_col = await asyncio.to_thread(get_column_names)
     
     def fetch_all_users():
@@ -290,11 +301,11 @@ async def status_list(i: discord.Interaction):
         line = f"{name} / {last} / {sid}\n"
         if len(current_page + line) > 1900:
             pages.append(current_page + "```")
-            current_page = "```text\n" + line
+            current_page = "
+```text\n" + line
         else:
             current_page += line
-    pages.append(current_page + "
-```")
+    pages.append(current_page + "```") # 오타 수정 완료
 
     await i.followup.send(pages[0])
     for page in pages[1:]:
@@ -366,4 +377,7 @@ async def set_channel(i: discord.Interaction, 역할: str):
     await i.followup.send(f"✅ {역할} 채널 설정 완료")
 
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    if not TOKEN:
+        print("Error: DISCORD_TOKEN 환경변수가 설정되지 않았습니다.")
+    else:
+        bot.run(TOKEN)
