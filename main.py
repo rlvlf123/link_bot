@@ -5,6 +5,7 @@ import requests
 import sqlite3
 import os
 import asyncio
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -21,13 +22,13 @@ def init_db():
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT * FROM users LIMIT 1")
-    except sqlite3.OperationalError:
-        cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-                            name_key TEXT PRIMARY KEY,
-                            steam_id TEXT,
-                            history TEXT)''')
+    
+    # 테이블 생성 및 감시 토글 필드(is_monitored) 추가
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+                        name_key TEXT PRIMARY KEY,
+                        steam_id TEXT,
+                        history TEXT,
+                        is_monitored INTEGER DEFAULT 0)''')
     
     cursor.execute('''CREATE TABLE IF NOT EXISTS channels (
                         guild_id TEXT PRIMARY KEY,
@@ -42,7 +43,7 @@ def get_db():
     return sqlite3.connect(DB_PATH)
 
 def get_column_names():
-    """DB 파일의 실제 컬럼명 구조를 감지하여 반환합니다 (동기 함수)."""
+    """DB 파일의 실제 컬럼명 구조를 감지하여 반환합니다."""
     conn = get_db()
     cursor = conn.cursor()
     try:
@@ -53,19 +54,18 @@ def get_column_names():
         name_col = "name_key" if "name_key" in cols else "NAME"
         sid_col = "steam_id" if "steam_id" in cols else "STEAM_ID"
         hist_col = "history" if "history" in cols else "HISTORY"
-        return name_col, sid_col, hist_col
-    except Exception as e:
-        print(f"[DB 컬럼 확인 에러] {e}")
-        try: conn.close() 
-        except: pass
-        return "name_key", "steam_id", "history"
+        mon_col = "is_monitored" if "is_monitored" in cols else "IS_MONITORED"
+        return name_col, sid_col, hist_col, mon_col
+    except:
+        conn.close()
+        return "name_key", "steam_id", "history", "is_monitored"
 
 # --- [3. 유틸리티 ] ---
 async def get_steam_users_info(steam_ids):
     if not steam_ids: 
         return []
     ids_str = ",".join(steam_ids)
-    url = f"[http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=](http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key=){STEAM_API_KEY}&steamids={ids_str}"
+    url = f"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/?key={STEAM_API_KEY}&steamids={ids_str}"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=10)
         if res.status_code == 200:
@@ -75,7 +75,7 @@ async def get_steam_users_info(steam_ids):
     return []
 
 async def get_nickname_from_xml(steam_id):
-    url = f"[https://steamcommunity.com/profiles/](https://steamcommunity.com/profiles/){steam_id}/?xml=1"
+    url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
     try:
         res = await asyncio.to_thread(requests.get, url, timeout=8)
         if res.status_code == 200:
@@ -83,21 +83,30 @@ async def get_nickname_from_xml(steam_id):
             node = root.find('steamID')
             if node is not None: 
                 return node.text
-    except ET.ParseError:
-        print(f"[XML 파싱 에러] 올바르지 않은 XML 형식이거나 스팀 서버 점검 중입니다.")
     except Exception as e:
-        print(f"[XML 통신 에러] {e}")
+        print(f"[XML 파싱 에러] {e}")
     return None
+
+def parse_sav_file(file_bytes):
+    """.sav 바이너리 파일 내부에서 SteamID(7656119...) 패턴을 추출합니다."""
+    found_players = []
+    try:
+        text_data = file_bytes.decode('utf-8', errors='ignore')
+        steam_ids = set(re.findall(r'7656119\d{10}', text_data))
+        for sid in steam_ids:
+            found_players.append(sid)
+    except Exception as e:
+        print(f"[SAV 파일 파싱 에러] {e}")
+    return found_players
 
 def create_status_embed(display_name, sid, history, mode="notify", player=None, is_private=False):
     colors = {"add": discord.Color.green(), "notify": discord.Color.gold(), "history": discord.Color.blue(), "exist": discord.Color.red()}
-    titles = {"add": "✨ 새 감시 대상 추가", "notify": "🔔 닉네임 변경 알림", "history": "📋 상세 변경 내역", "exist": "❌ 이미 등록된 유저 정보"}
+    titles = {"add": "✨ 새 감시 대상 설정", "notify": "🔔 닉네임 변경 알림", "history": "📋 상세 변경 내역", "exist": "❌ 정보 안내"}
     
     embed = discord.Embed(title=titles.get(mode, "알림"), color=colors.get(mode, discord.Color.light_grey()))
     
     if player:
-        if player.get('avatarfull'):
-            embed.set_thumbnail(url=player.get('avatarfull'))
+        embed.set_thumbnail(url=player.get('avatarfull'))
         status_map = {0: "🔴 오프라인", 1: "🟢 온라인", 2: "⛔ 바쁨", 3: "🌙 자리비움", 4: "💤 취침 중"}
         state = status_map.get(player.get('personastate', 0), "❓ 정보 없음")
         if is_private: 
@@ -124,37 +133,30 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=discord.Intents.all())
 
     async def setup_hook(self):
-        # 슬래시 명령어 동기화
         await self.tree.sync()
 
     async def on_ready(self):
         print(f"Logged in as {self.user.name} ({self.user.id})")
-        # 봇 로그인 완료 후 안정적으로 루프 시작
         if not self.check_steam_nicknames.is_running():
             self.check_steam_nicknames.start()
 
     @tasks.loop(minutes=5.0)
     async def check_steam_nicknames(self):
         def fetch_and_update_users():
-            name_col, sid_col, hist_col = get_column_names()
+            name_col, sid_col, hist_col, mon_col = get_column_names()
             conn = get_db()
             cursor = conn.cursor()
-            cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users")
+            cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col}, {mon_col} FROM users")
             rows = cursor.fetchall()
             
             cursor.execute("SELECT notify_id FROM channels")
-            # 디스코드 채널 ID 조회를 위해 int 형변환 보장
-            channels = [int(ch[0]) for ch in cursor.fetchall() if ch[0]]
+            channels = [ch[0] for ch in cursor.fetchall() if ch[0]]
             
             conn.close()
-            return rows, channels, (name_col, sid_col, hist_col)
+            return rows, channels, (name_col, sid_col, hist_col, mon_col)
 
-        try:
-            rows, notify_channels, cols = await asyncio.to_thread(fetch_and_update_users)
-            name_col, sid_col, hist_col = cols
-        except Exception as e:
-            print(f"[루프 DB 조회 에러] {e}")
-            return
+        rows, notify_channels, cols = await asyncio.to_thread(fetch_and_update_users)
+        name_col, sid_col, hist_col, mon_col = cols
         
         if not rows: 
             return
@@ -163,7 +165,7 @@ class MyBot(commands.Bot):
         players = await get_steam_users_info(ids)
         p_dict = {p['steamid']: p for p in players}
         
-        for name_key, sid, history_str in rows:
+        for name_key, sid, history_str, is_monitored in rows:
             history = history_str.split(" | ") if history_str else []
             player = p_dict.get(sid)
             
@@ -174,7 +176,6 @@ class MyBot(commands.Bot):
                 continue
             if history and curr_nick == history[-1]: 
                 continue
-            # 스팀 API 오동작 등으로 이전 닉네임이 임시 조회되었을 때 알림 폭탄 방지
             if len(history) >= 2 and curr_nick == history[-2]: 
                 continue
 
@@ -188,41 +189,34 @@ class MyBot(commands.Bot):
                 conn.commit()
                 conn.close()
                 
-            try:
-                await asyncio.to_thread(update_db, new_history_str, name_key)
-            except Exception as e:
-                print(f"[루프 DB 업데이트 에러] {e}")
-                continue
+            await asyncio.to_thread(update_db, new_history_str, name_key)
             
-            # 알림 메시지 생성 및 전송
-            is_private = player.get('communityvisibilitystate') != 3 if player else True
-            embed = create_status_embed(name_key, sid, history, "notify", player, is_private)
-            
-            for ch_id in notify_channels:
-                try:
-                    c = self.get_channel(ch_id) or await self.fetch_channel(ch_id)
-                    if c: 
-                        await c.send(embed=embed)
-                except discord.NotFound:
-                    print(f"[채널 에러] 존재하지 않는 채널 ID: {ch_id}")
-                except discord.Forbidden:
-                    print(f"[권한 에러] 채널 {ch_id}에 메시지를 보낼 권한이 없습니다.")
-                except Exception as e:
-                    print(f"[알림 전송 실패] {e}")
+            # 감시 상태인 인원만 디스코드 메시지 전송
+            if is_monitored == 1:
+                is_private = player.get('communityvisibilitystate') != 3 if player else True
+                embed = create_status_embed(name_key, sid, history, "notify", player, is_private)
+                
+                for ch_id in notify_channels:
+                    try:
+                        c = self.get_channel(ch_id) or await self.fetch_channel(ch_id)
+                        if c: 
+                            await c.send(embed=embed)
+                    except Exception:
+                        pass
 
 bot = MyBot()
 
 # --- [5. 명령어 구현] ---
-@bot.tree.command(name="추가", description="유저 추가 (별명 생략 시 스팀 닉네임으로 자동 등록)")
+
+@bot.tree.command(name="추가", description="유저를 '감시 대상'으로 등록하거나 기존 수집 대상을 감시로 전환합니다.")
 async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     await i.response.defer()
-    
-    name_col, sid_col, hist_col = await asyncio.to_thread(get_column_names)
+    name_col, sid_col, hist_col, mon_col = await asyncio.to_thread(get_column_names)
     
     def check_existing_user():
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users WHERE {sid_col} = ?", (steam_id,))
+        cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col}, {mon_col} FROM users WHERE {sid_col} = ?", (steam_id,))
         row = cursor.fetchone()
         conn.close()
         return row
@@ -230,14 +224,25 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
     exist_sid_row = await asyncio.to_thread(check_existing_user)
     
     if exist_sid_row:
-        exist_name, exist_sid, exist_hist = exist_sid_row
+        exist_name, exist_sid, exist_hist, is_monitored = exist_sid_row
         history_list = exist_hist.split(" | ") if exist_hist else ["없음"]
-        players = await get_steam_users_info([exist_sid])
-        player = players[0] if players else None
-        embed = create_status_embed(exist_name, exist_sid, history_list, "exist", player)
-        return await i.followup.send(content="❌ 이미 감시 목록에 등록되어 있는 스팀 ID입니다!", embed=embed)
+        
+        if is_monitored == 1:
+            players = await get_steam_users_info([exist_sid])
+            player = players[0] if players else None
+            embed = create_status_embed(exist_name, exist_sid, history_list, "exist", player)
+            return await i.followup.send(content="❌ 이미 감시 대상으로 알림이 켜져 있는 유저입니다.", embed=embed)
+        
+        def enable_monitoring():
+            conn = get_db()
+            cursor = conn.cursor()
+            cursor.execute(f"UPDATE users SET {mon_col} = 1 WHERE {sid_col} = ?", (steam_id,))
+            conn.commit()
+            conn.close()
+            
+        await asyncio.to_thread(enable_monitoring)
+        return await i.followup.send(content=f"✅ 기존 수집 유저 `{exist_name}`(을)를 **감시 대상**으로 전환했습니다! 이제 닉네임 변경 알림이 옵니다.")
 
-    # 2) 스팀 프로필 정보 조회
     players = await get_steam_users_info([steam_id])
     player = players[0] if players else None
     curr = (player.get('personaname') if player and player.get('communityvisibilitystate') == 3 
@@ -248,42 +253,72 @@ async def add_user(i: discord.Interaction, steam_id: str, nickname: str = None):
 
     final_nickname = nickname.strip() if nickname else curr.strip()
 
-    # 3) 새로 등록하려는 별명 중복 검사
-    def check_existing_name():
+    def save_new_monitored_user():
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users WHERE {name_col} = ?", (final_nickname,))
-        row = cursor.fetchone()
-        conn.close()
-        return row
-
-    exist_name_row = await asyncio.to_thread(check_existing_name)
-    if exist_name_row:
-        exist_name, exist_sid, exist_hist = exist_name_row
-        history_list = exist_hist.split(" | ") if exist_hist else ["없음"]
-        embed = create_status_embed(exist_name, exist_sid, history_list, "exist", player)
-        return await i.followup.send(content=f"❌ 이미 `{final_nickname}`이라는 별명으로 등록된 다른 유저가 존재합니다!", embed=embed)
-
-    # 4) DB 저장
-    def save_user():
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute(f"INSERT INTO users ({name_col}, {sid_col}, {hist_col}) VALUES (?, ?, ?)", (final_nickname, steam_id, curr))
+        cursor.execute(f"INSERT INTO users ({name_col}, {sid_col}, {hist_col}, {mon_col}) VALUES (?, ?, ?, 1)", (final_nickname, steam_id, curr))
         conn.commit()
         conn.close()
 
-    await asyncio.to_thread(save_user)
+    await asyncio.to_thread(save_new_monitored_user)
     await i.followup.send(embed=create_status_embed(final_nickname, steam_id, [curr], "add", player))
 
-@bot.tree.command(name="현황", description="전체 리스트 확인")
+
+@bot.tree.command(name="동기화", description="롱빈터 .sav 파일을 업로드하여 만난 유저 목록을 조용히 저장합니다.")
+async def sync_sav_file(i: discord.Interaction, file: discord.Attachment):
+    if not file.filename.endswith('.sav'):
+        return await i.response.send_message("❌ `.sav` 형식의 파일만 업로드할 수 있습니다.", ephemeral=True)
+        
+    await i.response.defer()
+    
+    file_bytes = await file.read()
+    discovered_steam_ids = await asyncio.to_thread(parse_sav_file, file_bytes)
+    
+    if not discovered_steam_ids:
+        return await i.followup.send("❌ 파일 내에서 유효한 스팀 ID 패턴을 찾지 못했거나 빈 파일입니다.")
+        
+    name_col, sid_col, hist_col, mon_col = await asyncio.to_thread(get_column_names)
+    
+    players = await get_steam_users_info(discovered_steam_ids)
+    p_dict = {p['steamid']: p.get('personaname', 'Unknown') for p in players}
+    
+    added_count = 0
+    
+    def bulk_insert_silent_users():
+        nonlocal added_count
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        for sid in discovered_steam_ids:
+            cursor.execute(f"SELECT 1 FROM users WHERE {sid_col} = ?", (sid,))
+            if cursor.fetchone():
+                continue
+                
+            initial_nick = p_dict.get(sid, f"Unsaved_{sid[-4:]}")
+            
+            cursor.execute(f"SELECT 1 FROM users WHERE {name_col} = ?", (initial_nick,))
+            if cursor.fetchone():
+                initial_nick = f"{initial_nick}_{sid[-4:]}"
+                
+            cursor.execute(f"INSERT INTO users ({name_col}, {sid_col}, {hist_col}, {mon_col}) VALUES (?, ?, ?, 0)", (initial_nick, sid, initial_nick))
+            added_count += 1
+            
+        conn.commit()
+        conn.close()
+        
+    await asyncio.to_thread(bulk_insert_silent_users)
+    await i.followup.send(f"📊 **.sav 동기화 완료!**\n새로운 롱빈터 조우 유저 **{added_count}명**을 데이터베이스에 추가했습니다. (※ 알림 감시는 꺼짐 상태이며, `/추가`를 통해 활성화할 수 있습니다.)")
+
+
+@bot.tree.command(name="현황", description="전체 리스트 및 감시 여부 확인")
 async def status_list(i: discord.Interaction):
-    await i.response.defer() 
-    name_col, sid_col, hist_col = await asyncio.to_thread(get_column_names)
+    await i.response.defer()
+    name_col, sid_col, hist_col, mon_col = await asyncio.to_thread(get_column_names)
     
     def fetch_all_users():
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col} FROM users")
+        cursor.execute(f"SELECT {name_col}, {sid_col}, {hist_col}, {mon_col} FROM users")
         rows = cursor.fetchall()
         conn.close()
         return rows
@@ -291,30 +326,32 @@ async def status_list(i: discord.Interaction):
     rows = await asyncio.to_thread(fetch_all_users)
 
     if not rows: 
-        return await i.followup.send("📊 감시 유저가 없습니다.")
+        return await i.followup.send("📊 저장된 유저가 없습니다.")
     
     pages = []
-    current_page = "📊 **감시 현황**\n```text\n별명 / 현재닉네임 / SteamID\n"
+    # 💡 [해결 부분] 깨진 닫는 따옴표 구문을 한 줄로 안전하게 수정 완료
+    current_page = "📊 **전체 조우 현황 (🔔=감시중 / 🔇=기록만)**\n```text\n상태 / 별명 / 현재닉네임 / SteamID\n"
     
-    for name, sid, hist in rows:
+    for name, sid, hist, is_monitored in rows:
         last = hist.split(" | ")[-1] if hist else "없음"
-        line = f"{name} / {last} / {sid}\n"
+        status_icon = "🔔" if is_monitored == 1 else "🔇"
+        line = f"{status_icon} / {name} / {last} / {sid}\n"
         if len(current_page + line) > 1900:
             pages.append(current_page + "```")
-            current_page = "
-```text\n" + line
+            current_page = "```text\n" + line
         else:
             current_page += line
-    pages.append(current_page + "```") # 오타 수정 완료
+    pages.append(current_page + "
+```")
 
     await i.followup.send(pages[0])
     for page in pages[1:]:
         await i.followup.send(page)
 
-@bot.tree.command(name="내역", description="특정 유저의 변경 내역 확인 (별명 또는 스팀아이디 입력 가능)")
+@bot.tree.command(name="내역", description="특정 유저의 변경 내역 확인")
 async def user_history(i: discord.Interaction, target: str):
     await i.response.defer()
-    name_col, sid_col, hist_col = await asyncio.to_thread(get_column_names)
+    name_col, sid_col, hist_col, _ = await asyncio.to_thread(get_column_names)
     
     def fetch_target_user():
         conn = get_db()
@@ -325,46 +362,36 @@ async def user_history(i: discord.Interaction, target: str):
         return row
 
     row = await asyncio.to_thread(fetch_target_user)
-
     if not row: 
-        return await i.followup.send(f"❌ `{target}`에 해당하는 유저를 감시 목록에서 찾을 수 없습니다.")
+        return await i.followup.send(f"❌ `{target}`에 해당하는 유저를 목록에서 찾을 수 없습니다.")
     
     name, sid, hist_str = row
     history = hist_str.split(" | ") if hist_str else []
     players = await get_steam_users_info([sid])
     player = players[0] if players else None
-    
     await i.followup.send(embed=create_status_embed(name, sid, history, "history", player))
 
-@bot.tree.command(name="삭제", description="유저 삭제 (별명 또는 스팀아이디 입력 가능)")
+@bot.tree.command(name="삭제", description="유저 데이터 완전 삭제")
 async def delete_user(i: discord.Interaction, target: str):
     await i.response.defer()
-    name_col, sid_col, hist_col = await asyncio.to_thread(get_column_names)
-    
+    name_col, sid_col, _, _ = await asyncio.to_thread(get_column_names)
     def remove_user():
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute(f"DELETE FROM users WHERE {name_col} = ? OR {sid_col} = ?", (target.strip(), target.strip()))
         count = cursor.rowcount
-        if count > 0:
-            conn.commit()
+        if count > 0: conn.commit()
         conn.close()
         return count
-
     row_count = await asyncio.to_thread(remove_user)
-    if row_count > 0:
-        await i.followup.send(f"✅ `{target}` 삭제 완료")
-    else:
-        await i.followup.send("❌ 찾을 수 없습니다.")
+    if row_count > 0: await i.followup.send(f"✅ `{target}` 정보 완전 삭제 완료")
+    else: await i.followup.send("❌ 찾을 수 없습니다.")
 
 @bot.tree.command(name="채널설정", description="채널 설정")
 @app_commands.choices(역할=[app_commands.Choice(name="관리", value="admin"), app_commands.Choice(name="알림", value="notify")])
 async def set_channel(i: discord.Interaction, 역할: str):
-    if not i.user.guild_permissions.administrator: 
-        return await i.response.send_message("❌ 권한 없음", ephemeral=True)
-        
+    if not i.user.guild_permissions.administrator: return await i.response.send_message("❌ 권한 없음", ephemeral=True)
     await i.response.defer()
-
     def update_channel_settings():
         conn = get_db()
         cursor = conn.cursor()
@@ -372,12 +399,8 @@ async def set_channel(i: discord.Interaction, 역할: str):
         cursor.execute(f"INSERT INTO channels (guild_id, {col}) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET {col}=excluded.{col}", (str(i.guild_id), i.channel_id))
         conn.commit()
         conn.close()
-
     await asyncio.to_thread(update_channel_settings)
     await i.followup.send(f"✅ {역할} 채널 설정 완료")
 
 if __name__ == "__main__":
-    if not TOKEN:
-        print("Error: DISCORD_TOKEN 환경변수가 설정되지 않았습니다.")
-    else:
-        bot.run(TOKEN)
+    bot.run(TOKEN)
