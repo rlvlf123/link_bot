@@ -15,6 +15,9 @@ import xml.etree.ElementTree as ET
 
 from contextlib import contextmanager
 from datetime import datetime
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+import uvicorn
 
 # =========================
 # 설정
