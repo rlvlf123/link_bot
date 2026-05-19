@@ -1438,18 +1438,18 @@ async def run_api():
         api,
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
-        log_level="warning",
-        loop="none"
+        log_level="info",
     )
     server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # Railway 시그널 충돌 방지
     await server.serve()
 
 
 async def main():
-    loop = asyncio.get_event_loop()
-    api_task = loop.create_task(run_api())
-    bot_task = loop.create_task(bot.start(TOKEN))
-    await asyncio.gather(api_task, bot_task)
+    await asyncio.gather(
+        run_api(),
+        bot.start(TOKEN),
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
