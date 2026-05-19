@@ -657,6 +657,15 @@ async def check_admin_channel(interaction: discord.Interaction) -> bool:
 
     return True
 
+
+async def check_admin_permission(interaction: discord.Interaction) -> bool:
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "❌ 관리자 권한이 필요합니다", ephemeral=True
+        )
+        return False
+    return True
+
 # =========================
 # 유저 조회
 # =========================
@@ -778,6 +787,8 @@ async def add_user(i: discord.Interaction, target: str, 별명: str = None):
 
 @bot.tree.command(name="삭제", description="알림 감시 해제")
 async def delete_user(i: discord.Interaction, target: str):
+    if not await check_admin_permission(i):
+        return
     if not await check_admin_channel(i):
         return
 
@@ -1016,6 +1027,8 @@ async def set_channel(i: discord.Interaction, 역할: str):
 
 @bot.tree.command(name="동기화", description=".sav 파일을 업로드해 Steam ID를 DB에 일괄 등록")
 async def sync_sav(i: discord.Interaction):
+    if not await check_admin_permission(i):
+        return
     if not await check_admin_channel(i):
         return
 
