@@ -35,19 +35,31 @@ def restore_db_if_missing():
     if DB_PATH == _SEED_DB_PATH:
         return  # Volume 미사용 환경이면 스킵
 
-    if os.path.exists(DB_PATH):
-        print(f"[DB] Volume DB 존재 확인: {DB_PATH}")
+    import shutil
+
+    seed_exists = os.path.exists(_SEED_DB_PATH)
+    volume_exists = os.path.exists(DB_PATH)
+
+    if not seed_exists:
+        print(f"[DB] 초기 DB 없음. 새 DB로 시작합니다.")
         return
 
-    # Volume 경로에 DB가 없으면 초기 DB 복사
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
-    if os.path.exists(_SEED_DB_PATH):
-        import shutil
+    if not volume_exists:
         shutil.copy2(_SEED_DB_PATH, DB_PATH)
         print(f"[DB] 초기 DB 복원 완료: {_SEED_DB_PATH} → {DB_PATH}")
+        return
+
+    # Volume DB가 있어도 seed DB보다 작으면 (빈 DB면) 덮어쓰기
+    seed_size = os.path.getsize(_SEED_DB_PATH)
+    volume_size = os.path.getsize(DB_PATH)
+
+    if volume_size < seed_size:
+        shutil.copy2(_SEED_DB_PATH, DB_PATH)
+        print(f"[DB] Volume DB가 초기 DB보다 작아 덮어씀 ({volume_size} < {seed_size})")
     else:
-        print(f"[DB] 초기 DB 없음. 새 DB로 시작합니다.")
+        print(f"[DB] Volume DB 사용 중: {DB_PATH} ({volume_size} bytes)")
 
 restore_db_if_missing()
 
@@ -1126,6 +1138,68 @@ async def sync_sav(i: discord.Interaction):
     embed.set_footer(text="신규 등록된 유저는 is_monitored=0 (알림 비활성) 상태입니다. /추가로 감시 활성화하세요.")
 
     await i.followup.send(embed=embed)
+
+
+# =========================
+# /도움말
+# =========================
+
+@bot.tree.command(name="도움말", description="봇 명령어 안내")
+async def help_command(i: discord.Interaction):
+    embed = discord.Embed(
+        title="📖 롱빈터 스팀 트래커 봇 도움말",
+        color=discord.Color.blurple()
+    )
+
+    embed.add_field(
+        name="👤 유저 관리",
+        value=(
+            "`/추가 [SteamID] (별명)` — 유저를 감시 목록에 등록, 닉변 알림 활성화\n"
+            "`/삭제 [SteamID 또는 별명]` — 감시 해제 (DB에서 삭제되진 않음)\n"
+            "`/내역 [SteamID 또는 별명]` — 닉네임 변경 내역 확인"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📊 현황 확인",
+        value=(
+            "`/현황` — 현재 알림 감시 중인 유저 목록\n"
+            "`/전체현황` — DB에 저장된 전체 유저 수 및 통계 (닉변 TOP 5 등)"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔄 동기화",
+        value=(
+            "`/동기화` — .sav 파일을 업로드하면 Steam ID를 DB에 일괄 등록\n"
+            "　　　　　등록된 유저는 알림 비활성(is_monitored=0) 상태\n"
+            "　　　　　알림을 받으려면 `/추가`로 감시 활성화 필요"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚙️ 설정",
+        value=(
+            "`/채널설정 [관리/알림]` — 명령어를 사용할 관리 채널 / 닉변 알림을 받을 채널 설정\n"
+            "　　　　　　　관리자 권한 필요"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="ℹ️ 참고",
+        value=(
+            "• `/추가`로 등록된 유저만 닉변 알림이 옵니다\n"
+            "• `/동기화`로 등록된 유저는 닉변 기록은 되지만 알림은 오지 않습니다\n"
+            "• 닉네임은 5분마다 자동으로 갱신됩니다"
+        ),
+        inline=False
+    )
+
+    await i.response.send_message(embed=embed)
 
 
 if __name__ == "__main__":
