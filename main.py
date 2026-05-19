@@ -1389,6 +1389,14 @@ def _verify_session(session_token: str) -> bool:
     return session_token in _sessions
 
 
+# ── 세션 검증 엔드포인트 ──
+@api.get("/auth/verify")
+async def auth_verify(session_token: str = ""):
+    if _verify_session(session_token):
+        return JSONResponse(content={"valid": True})
+    return JSONResponse(status_code=401, content={"valid": False})
+
+
 # ── 유저 조회 ──
 @api.get("/user")
 async def get_user(steam_id: str, session_token: str = ""):
