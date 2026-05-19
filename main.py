@@ -971,5 +971,135 @@ async def set_channel(i: discord.Interaction, 역할: str):
 # 실행
 # =========================
 
+# =========================
+# /동기화
+# =========================
+
+@bot.tree.command(name="동기화", description=".sav 파일을 업로드해 Steam ID를 DB에 일괄 등록")
+async def sync_sav(i: discord.Interaction):
+    if not await check_admin_channel(i):
+        return
+
+    # 파일 첨부 안내 메시지 전송
+    await i.response.send_message(
+        "📂 **seenplayers.sav 파일을 첨부해서 보내주세요.**\n"
+        "여러 파일을 한 번에 올려도 됩니다. (예: Uuvana1~3, UuvanaHARDCORE)\n"
+        "⏳ 60초 안에 업로드해주세요.",
+        ephemeral=False
+    )
+
+    # 파일 업로드 대기
+    def check(m: discord.Message):
+        return (
+            m.channel.id == i.channel_id
+            and m.author.id == i.user.id
+            and len(m.attachments) > 0
+            and any(a.filename.endswith(".sav") for a in m.attachments)
+        )
+
+    try:
+        msg: discord.Message = await bot.wait_for("message", check=check, timeout=60.0)
+    except asyncio.TimeoutError:
+        return await i.followup.send("⏰ 시간 초과. `/동기화`를 다시 실행해주세요.", ephemeral=True)
+
+    sav_attachments = [a for a in msg.attachments if a.filename.endswith(".sav")]
+
+    await i.followup.send(
+        f"⚙️ {len(sav_attachments)}개 파일 처리 중... (Steam ID 추출 → DB 등록)\n"
+        f"유저 수에 따라 시간이 걸릴 수 있어요."
+    )
+
+    # 파일별 Steam ID 수집
+    session = await get_http_session()
+    found_ids: set[str] = set()
+
+    for attachment in sav_attachments:
+        try:
+            async with session.get(attachment.url, timeout=aiohttp.ClientTimeout(total=30)) as res:
+                if res.status == 200:
+                    file_bytes = await res.read()
+                    parsed = parse_sav_file(file_bytes)
+                    for item in parsed:
+                        found_ids.add(item["steam_id"])
+                    print(f"[동기화] {attachment.filename}: {len(parsed)}개 ID 추출")
+        except Exception as e:
+            print(f"[동기화 파일 오류] {attachment.filename}: {e}")
+
+    if not found_ids:
+        return await i.followup.send("❌ .sav 파일에서 Steam ID를 찾을 수 없었어요.")
+
+    # DB에 없는 신규 ID 필터링
+    with db_connection(auto_commit=False) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT steam_id FROM users")
+        existing_ids = {row[0] for row in cursor.fetchall()}
+
+    truly_new = list(found_ids - existing_ids)
+    already_count = len(found_ids) - len(truly_new)
+
+    if not truly_new:
+        return await i.followup.send(
+            f"✅ 동기화 완료!\n"
+            f"📊 .sav 총 Steam ID: {len(found_ids):,}개\n"
+            f"🔁 이미 DB에 있는 유저: {already_count:,}명\n"
+            f"🆕 신규 등록: 0명 (모두 이미 등록됨)"
+        )
+
+    await i.followup.send(
+        f"🔍 신규 유저 {len(truly_new):,}명 발견! Steam 닉네임 조회 중...\n"
+        f"(100명당 약 1~2초 소요, 총 예상 시간: 약 {max(1, len(truly_new) // 100 * 2)}초)"
+    )
+
+    # Steam API로 닉네임 일괄 조회
+    players = await get_steam_users_info(truly_new)
+    p_dict = {p["steamid"]: p for p in players}
+
+    # DB 등록
+    registered = 0
+    failed_nick = 0
+
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        for sid in truly_new:
+            try:
+                player = p_dict.get(sid)
+                current_name = await get_current_nickname(sid, player)
+
+                if current_name is None:
+                    current_name = ""
+                    failed_nick += 1
+
+                base_key = f"user_{sid[-6:]}"
+                name_key = unique_name_key(cursor, base_key)
+
+                cursor.execute("""
+                    INSERT OR IGNORE INTO users
+                        (steam_id, name_key, current_name, is_monitored, updated_at)
+                    VALUES (?, ?, ?, 0, ?)
+                """, (sid, name_key, current_name, datetime.now().isoformat()))
+
+                if current_name:
+                    add_history_if_needed(cursor, sid, current_name)
+
+                registered += 1
+
+            except Exception as e:
+                print(f"[동기화 등록 오류] {sid}: {e}")
+
+    # 최종 결과 리포트
+    embed = discord.Embed(
+        title="✅ .sav 동기화 완료",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="📂 처리한 파일 수", value=f"{len(sav_attachments)}개", inline=True)
+    embed.add_field(name="👥 .sav 총 Steam ID", value=f"{len(found_ids):,}개", inline=True)
+    embed.add_field(name="🔁 이미 등록된 유저", value=f"{already_count:,}명", inline=True)
+    embed.add_field(name="🆕 신규 등록 완료", value=f"{registered:,}명", inline=True)
+    embed.add_field(name="⚠️ 닉네임 조회 실패", value=f"{failed_nick:,}명 (ID는 등록됨)", inline=True)
+    embed.set_footer(text="신규 등록된 유저는 is_monitored=0 (알림 비활성) 상태입니다. /추가로 감시 활성화하세요.")
+
+    await i.followup.send(embed=embed)
+
+
 if __name__ == "__main__":
     bot.run(TOKEN)
