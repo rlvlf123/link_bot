@@ -1434,16 +1434,22 @@ async def get_user(steam_id: str, session_token: str = ""):
 
 
 async def run_api():
-    config = uvicorn.Config(api, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="warning")
+    config = uvicorn.Config(
+        api,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000)),
+        log_level="warning",
+        loop="none"
+    )
     server = uvicorn.Server(config)
     await server.serve()
 
 
 async def main():
-    await asyncio.gather(
-        run_api(),
-        bot.start(TOKEN)
-    )
+    loop = asyncio.get_event_loop()
+    api_task = loop.create_task(run_api())
+    bot_task = loop.create_task(bot.start(TOKEN))
+    await asyncio.gather(api_task, bot_task)
 
 if __name__ == "__main__":
     asyncio.run(main())
