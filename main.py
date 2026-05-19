@@ -1288,5 +1288,159 @@ async def bulk_monitor(i: discord.Interaction):
     await i.followup.send(embed=embed)
 
 
+
+# =========================
+# HTTP API 서버 (로컬 클라이언트용)
+# =========================
+
+api = FastAPI()
+
+DISCORD_CLIENT_ID     = os.getenv("DISCORD_CLIENT_ID")
+DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+ALLOWED_GUILD_IDS     = set(os.getenv("ALLOWED_GUILD_IDS", "").split(","))
+REDIRECT_URI          = "http://localhost:7777/callback"
+
+# 세션 토큰 저장소 {session_token: discord_user_id}
+_sessions: dict = {}
+
+
+def _make_session_token() -> str:
+    import secrets
+    return secrets.token_urlsafe(32)
+
+
+# ── OAuth2 로그인 URL 반환 ──
+@api.get("/auth/login")
+async def auth_login():
+    import urllib.parse
+    params = urllib.parse.urlencode({
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify guilds",
+    })
+    return JSONResponse(content={"url": f"https://discord.com/oauth2/authorize?{params}"})
+
+
+# ── OAuth2 콜백 (로컬 서버가 받아서 봇 서버로 전달) ──
+@api.get("/auth/callback")
+async def auth_callback(code: str):
+    session = await get_http_session()
+
+    # 액세스 토큰 교환
+    try:
+        async with session.post(
+            "https://discord.com/api/oauth2/token",
+            data={
+                "client_id": DISCORD_CLIENT_ID,
+                "client_secret": DISCORD_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": REDIRECT_URI,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ) as res:
+            token_data = await res.json()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    access_token = token_data.get("access_token")
+    if not access_token:
+        return JSONResponse(status_code=401, content={"error": "토큰 발급 실패"})
+
+    # 유저 정보 조회
+    try:
+        async with session.get(
+            "https://discord.com/api/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"},
+        ) as res:
+            user_data = await res.json()
+
+        async with session.get(
+            "https://discord.com/api/users/@me/guilds",
+            headers={"Authorization": f"Bearer {access_token}"},
+        ) as res:
+            guilds_data = await res.json()
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    # 허용 서버 멤버 확인
+    user_guild_ids = {str(g["id"]) for g in guilds_data}
+    if not (user_guild_ids & ALLOWED_GUILD_IDS):
+        return JSONResponse(status_code=403, content={"error": "허용된 서버 멤버가 아닙니다"})
+
+    # 세션 발급
+    session_token = _make_session_token()
+    _sessions[session_token] = user_data.get("id")
+    username = user_data.get("username", "unknown")
+    print(f"[인증 성공] {username} ({user_data.get('id')})")
+
+    return JSONResponse(content={
+        "session_token": session_token,
+        "username": username,
+    })
+
+
+# ── 세션 검증 ──
+def _verify_session(session_token: str) -> bool:
+    return session_token in _sessions
+
+
+# ── 유저 조회 ──
+@api.get("/user")
+async def get_user(steam_id: str, session_token: str = ""):
+    if not _verify_session(session_token):
+        return JSONResponse(status_code=401, content={"error": "인증이 필요합니다"})
+
+    try:
+        # API는 읽기 전용 별도 연결 사용 (DB 락 방지)
+        conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT steam_id, name_key, current_name, is_monitored
+            FROM users WHERE steam_id = ?
+        """, (steam_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            conn.close()
+            return JSONResponse(content={"found": False, "steam_id": steam_id})
+
+        cursor.execute("""
+            SELECT nickname FROM nickname_history
+            WHERE steam_id = ?
+            ORDER BY id ASC
+        """, (steam_id,))
+        history = [r[0] for r in cursor.fetchall()]
+        conn.close()
+
+        return JSONResponse(content={
+            "found": True,
+            "steam_id": row["steam_id"],
+            "name_key": row["name_key"],
+            "current_name": row["current_name"],
+            "is_monitored": bool(row["is_monitored"]),
+            "history": history
+        })
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+async def run_api():
+    config = uvicorn.Config(api, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="warning")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+async def main():
+    await asyncio.gather(
+        run_api(),
+        bot.start(TOKEN)
+    )
+
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    asyncio.run(main())
