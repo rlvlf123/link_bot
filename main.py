@@ -24,6 +24,33 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 
+# =========================
+# Volume DB 자동 복원
+# Volume에 DB가 없을 때 GitHub에 있는 초기 DB를 복사
+# =========================
+
+_SEED_DB_PATH = "bot_data.db"  # GitHub에 올라간 초기 DB 경로
+
+def restore_db_if_missing():
+    if DB_PATH == _SEED_DB_PATH:
+        return  # Volume 미사용 환경이면 스킵
+
+    if os.path.exists(DB_PATH):
+        print(f"[DB] Volume DB 존재 확인: {DB_PATH}")
+        return
+
+    # Volume 경로에 DB가 없으면 초기 DB 복사
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+    if os.path.exists(_SEED_DB_PATH):
+        import shutil
+        shutil.copy2(_SEED_DB_PATH, DB_PATH)
+        print(f"[DB] 초기 DB 복원 완료: {_SEED_DB_PATH} → {DB_PATH}")
+    else:
+        print(f"[DB] 초기 DB 없음. 새 DB로 시작합니다.")
+
+restore_db_if_missing()
+
 SAVE_DIR = os.getenv(
     "SAVE_DIR",
     r"C:\Users\peal\AppData\Local\Longvinter\Saved\SaveGames"
