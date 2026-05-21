@@ -90,31 +90,19 @@ def get_db() -> sqlite3.Connection:
 
 @contextmanager
 def db_connection(auto_commit: bool = True):
-    import time
-    max_retries = 5
-    for attempt in range(max_retries):
-        conn = get_db()
+    conn = get_db()
+    try:
+        yield conn
+        if auto_commit:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         try:
-            yield conn
-            if auto_commit:
-                conn.commit()
-            return
-        except sqlite3.OperationalError as e:
-            conn.rollback()
             conn.close()
-            if "database is locked" in str(e) and attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-            raise
-        except Exception:
-            conn.rollback()
-            conn.close()
-            raise
-        finally:
-            try:
-                conn.close()
-            except:
-                pass
+        except:
+            pass
 
 
 def ensure_column(cursor: sqlite3.Cursor, table: str, column: str, column_type: str):
