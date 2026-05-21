@@ -29,14 +29,13 @@ DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 
 # =========================
 # Volume DB 자동 복원
-# Volume에 DB가 없을 때 GitHub에 있는 초기 DB를 복사
 # =========================
 
-_SEED_DB_PATH = "bot_data.db"  # GitHub에 올라간 초기 DB 경로
+_SEED_DB_PATH = "bot_data.db"
 
 def restore_db_if_missing():
     if DB_PATH == _SEED_DB_PATH:
-        return  # Volume 미사용 환경이면 스킵
+        return
 
     import shutil
 
@@ -54,7 +53,6 @@ def restore_db_if_missing():
         print(f"[DB] 초기 DB 복원 완료: {_SEED_DB_PATH} → {DB_PATH}")
         return
 
-    # Volume DB가 있어도 seed DB보다 작으면 (빈 DB면) 덮어쓰기
     seed_size = os.path.getsize(_SEED_DB_PATH)
     volume_size = os.path.getsize(DB_PATH)
 
@@ -83,14 +81,10 @@ WATCH_FILES = [
 # =========================
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=60,
-        check_same_thread=False
-    )
+    conn = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=60000")  # 60초 대기
+    conn.execute("PRAGMA busy_timeout=60000")
     return conn
 
 
@@ -143,7 +137,6 @@ def init_db():
     with db_connection() as conn:
         cursor = conn.cursor()
 
-        # users
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 steam_id TEXT PRIMARY KEY,
@@ -156,16 +149,19 @@ def init_db():
         ensure_column(cursor, "users", "is_monitored", "INTEGER DEFAULT 0")
         ensure_column(cursor, "users", "updated_at", "TEXT")
 
-        # channels
+        # channels - 서버당 관리/알림 채널 2개씩
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 guild_id TEXT PRIMARY KEY,
                 admin_id INTEGER,
-                notify_id INTEGER
+                notify_id INTEGER,
+                admin_id2 INTEGER,
+                notify_id2 INTEGER
             )
         """)
+        ensure_column(cursor, "channels", "admin_id2", "INTEGER")
+        ensure_column(cursor, "channels", "notify_id2", "INTEGER")
 
-        # nickname_history
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS nickname_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,13 +171,11 @@ def init_db():
             )
         """)
 
-        # 인덱스: nickname_history 조회 성능 향상
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_nickname_history_steam_id
             ON nickname_history (steam_id, id)
         """)
 
-        # 기존 history 컬럼 → nickname_history 테이블 마이그레이션
         cursor.execute("SELECT steam_id, history, current_name FROM users")
         rows = cursor.fetchall()
 
@@ -235,7 +229,7 @@ def unique_name_key(cursor: sqlite3.Cursor, base: str) -> str:
         count += 1
 
 # =========================
-# Steam API (aiohttp 세션 재사용)
+# Steam API
 # =========================
 
 _http_session: aiohttp.ClientSession | None = None
@@ -402,22 +396,13 @@ def create_status_embed(
     return embed
 
 # =========================
-# SAV 스캔: 신규 유저 DB 등록만 담당
-# (닉네임 추적은 nickname_track_loop에서 별도 처리)
+# SAV 스캔
 # =========================
 
 async def scan_sav_and_register() -> list[str]:
-    """
-    SAV 파일을 스캔해 DB에 없는 신규 Steam ID를 등록합니다.
-    - is_monitored=0 (알림 비활성) 상태로 등록
-    - 닉네임은 등록 시점에 Steam API로 조회해 저장
-    - 이미 DB에 있는 유저는 건드리지 않음
-    반환값: 새로 등록된 steam_id 목록
-    """
     new_ids: list[str] = []
     found_ids: set[str] = set()
 
-    # SAV 파일에서 모든 Steam ID 수집
     for filename in WATCH_FILES:
         path = os.path.join(SAVE_DIR, filename)
         if not os.path.exists(path):
@@ -434,7 +419,6 @@ async def scan_sav_and_register() -> list[str]:
     if not found_ids:
         return new_ids
 
-    # DB에 없는 신규 ID만 필터링
     with db_connection(auto_commit=False) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT steam_id FROM users")
@@ -446,7 +430,6 @@ async def scan_sav_and_register() -> list[str]:
 
     print(f"[SAV 신규 발견] {len(truly_new)}명")
 
-    # 신규 유저 닉네임 조회 (100명씩 배치)
     players = await get_steam_users_info(truly_new)
     p_dict = {p["steamid"]: p for p in players}
 
@@ -457,7 +440,6 @@ async def scan_sav_and_register() -> list[str]:
             current_name = await get_current_nickname(sid, player)
 
             if current_name is None:
-                # 닉네임 조회 실패 시 임시 키로만 등록
                 current_name = ""
 
             base_key = f"user_{sid[-6:]}"
@@ -473,27 +455,13 @@ async def scan_sav_and_register() -> list[str]:
                 add_history_if_needed(cursor, sid, current_name)
 
             new_ids.append(sid)
-            print(f"[신규 등록] {current_name or '(이름없음)'} ({sid}) → {name_key}")
 
     return new_ids
 
 
-# =========================
-# 전체 유저 닉네임 추적
-# - 모든 유저(is_monitored 무관)의 닉네임 변경을 히스토리에 저장
-# - is_monitored=1 유저만 알림 대상으로 반환
-# =========================
-
 async def track_all_nicknames() -> list[tuple]:
-    """
-    DB의 모든 유저 닉네임을 Steam API로 갱신합니다.
-    닉네임이 변경되고 is_monitored=1인 유저만 알림 대상으로 반환합니다.
-
-    반환값: [(name_key, sid, history, player), ...]
-    """
     pending_notify: list[tuple] = []
 
-    # 전체 유저 조회
     try:
         with db_connection(auto_commit=False) as conn:
             cursor = conn.cursor()
@@ -522,14 +490,11 @@ async def track_all_nicknames() -> list[tuple]:
                 curr = await get_current_nickname(sid, player)
 
                 if curr is None:
-                    # 조회 실패: 스킵 (히스토리도 건드리지 않음)
                     continue
 
                 if curr == old_name:
-                    # 변경 없음
                     continue
 
-                # 닉네임 변경 감지 → DB 갱신
                 cursor.execute("""
                     UPDATE users SET current_name = ?, updated_at = ?
                     WHERE steam_id = ?
@@ -537,7 +502,6 @@ async def track_all_nicknames() -> list[tuple]:
 
                 changed = add_history_if_needed(cursor, sid, curr)
 
-                # is_monitored=1인 유저만 알림 목록에 추가
                 if changed and is_monitored == 1:
                     history = get_history_list(cursor, sid)
                     pending_notify.append((name_key, sid, history, player))
@@ -581,8 +545,6 @@ class MyBot(commands.Bot):
             await _http_session.close()
         await super().close()
 
-    # ── SAV 스캔 루프: 30초마다 신규 유저 등록 ──
-    # 가벼운 작업 (DB에 없는 ID만 Steam API 호출)
     @tasks.loop(seconds=30)
     async def sav_scan_loop(self):
         async with self.scan_lock:
@@ -597,8 +559,6 @@ class MyBot(commands.Bot):
     async def sav_scan_loop_error(self, error):
         print(f"[sav_scan_loop 예외] {error}")
 
-    # ── 닉네임 추적 루프: 5분마다 전체 유저 닉변 체크 ──
-    # 무거운 작업 (전체 유저 Steam API 호출)
     @tasks.loop(minutes=5)
     async def nickname_track_loop(self):
         async with self.track_lock:
@@ -608,13 +568,15 @@ class MyBot(commands.Bot):
                 if not pending_notify:
                     return
 
-                # 알림 채널 조회
+                # 알림 채널 조회 (notify_id + notify_id2)
                 with db_connection(auto_commit=False) as conn:
                     cursor = conn.cursor()
-                    cursor.execute("SELECT notify_id FROM channels")
-                    notify_channels = [x[0] for x in cursor.fetchall() if x[0]]
+                    cursor.execute("SELECT notify_id, notify_id2 FROM channels")
+                    notify_channels = []
+                    for row in cursor.fetchall():
+                        if row[0]: notify_channels.append(row[0])
+                        if row[1]: notify_channels.append(row[1])
 
-                # 알림 전송
                 for name_key, sid, history, player in pending_notify:
                     embed = create_status_embed(name_key, sid, history, "notify", player)
 
@@ -644,16 +606,14 @@ bot = MyBot()
 
 async def check_admin_channel(interaction: discord.Interaction) -> bool:
     if interaction.guild is None:
-        await interaction.response.send_message(
-            "❌ 서버에서만 사용 가능합니다", ephemeral=True
-        )
+        await interaction.response.send_message("❌ 서버에서만 사용 가능합니다", ephemeral=True)
         return False
 
     try:
         with db_connection(auto_commit=False) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT admin_id FROM channels WHERE guild_id = ?",
+                "SELECT admin_id, admin_id2 FROM channels WHERE guild_id = ?",
                 (str(interaction.guild_id),)
             )
             row = cursor.fetchone()
@@ -662,16 +622,13 @@ async def check_admin_channel(interaction: discord.Interaction) -> bool:
         await interaction.response.send_message("❌ DB 오류가 발생했습니다", ephemeral=True)
         return False
 
-    if not row or not row[0]:
-        await interaction.response.send_message(
-            "❌ 먼저 /채널설정 으로 관리 채널을 설정하세요", ephemeral=True
-        )
+    if not row or (not row[0] and not row[1]):
+        await interaction.response.send_message("❌ 먼저 /채널설정 으로 관리 채널을 설정하세요", ephemeral=True)
         return False
 
-    if interaction.channel_id != row[0]:
-        await interaction.response.send_message(
-            "❌ 관리 채널에서만 사용 가능합니다", ephemeral=True
-        )
+    allowed = set(x for x in [row[0], row[1]] if x)
+    if interaction.channel_id not in allowed:
+        await interaction.response.send_message("❌ 관리 채널에서만 사용 가능합니다", ephemeral=True)
         return False
 
     return True
@@ -679,9 +636,7 @@ async def check_admin_channel(interaction: discord.Interaction) -> bool:
 
 async def check_admin_permission(interaction: discord.Interaction) -> bool:
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message(
-            "❌ 관리자 권한이 필요합니다", ephemeral=True
-        )
+        await interaction.response.send_message("❌ 관리자 권한이 필요합니다", ephemeral=True)
         return False
     return True
 
@@ -717,25 +672,18 @@ async def add_user(i: discord.Interaction, target: str, 별명: str = None):
         with db_connection() as conn:
             cursor = conn.cursor()
 
-            # 별명 중복 체크
             if 별명:
-                cursor.execute("""
-                    SELECT steam_id, current_name, name_key
-                    FROM users WHERE name_key = ?
-                """, (별명.strip(),))
+                cursor.execute("SELECT steam_id, current_name, name_key FROM users WHERE name_key = ?", (별명.strip(),))
                 dup = cursor.fetchone()
                 if dup:
                     return await i.followup.send(
                         f"❌ 이미 사용중인 별명입니다\n\n"
-                        f"등록 별명: {dup[2]}\n"
-                        f"최근 닉네임: {dup[1]}\n"
-                        f"SteamID: {dup[0]}"
+                        f"등록 별명: {dup[2]}\n최근 닉네임: {dup[1]}\nSteamID: {dup[0]}"
                     )
 
             row = find_user(cursor, target)
 
             if not row:
-                # DB에 없으면 SteamID로 직접 조회 후 등록
                 if not target.isdigit():
                     return await i.followup.send("❌ 존재하지 않는 유저입니다")
 
@@ -744,7 +692,7 @@ async def add_user(i: discord.Interaction, target: str, 별명: str = None):
                 player = players[0] if players else None
 
                 if not player:
-                    return await i.followup.send("❌ Steam 유저 조회 실패")
+                    return await i.followup.send(f"❌ Steam 유저 조회 실패: `{sid}`")
 
                 current_name = await get_current_nickname(sid, player)
                 if current_name is None:
@@ -759,7 +707,6 @@ async def add_user(i: discord.Interaction, target: str, 별명: str = None):
                 """, (sid, name_key, current_name, datetime.now().isoformat()))
 
                 add_history_if_needed(cursor, sid, current_name)
-
                 sid_out, current_name_out, name_key_out = sid, current_name, name_key
 
             else:
@@ -769,29 +716,19 @@ async def add_user(i: discord.Interaction, target: str, 별명: str = None):
                 if monitored_out == 1:
                     return await i.followup.send(
                         f"❌ 이미 감시중인 SteamID입니다\n\n"
-                        f"등록 별명: {name_key_out}\n"
-                        f"최근 닉네임: {current_name_out}\n"
-                        f"SteamID: {sid_out}"
+                        f"등록 별명: {name_key_out}\n최근 닉네임: {current_name_out}\nSteamID: {sid_out}"
                     )
 
-                # 별명 변경이 있으면 반영
                 new_name_key = 별명.strip() if 별명 else name_key_out
-
-                cursor.execute("""
-                    UPDATE users SET is_monitored = 1, name_key = ?
-                    WHERE steam_id = ?
-                """, (new_name_key, sid_out))
-
+                cursor.execute("UPDATE users SET is_monitored = 1, name_key = ? WHERE steam_id = ?", (new_name_key, sid_out))
                 name_key_out = new_name_key
 
             history = get_history_list(cursor, sid_out)
-            sid_out = sid_out if 'sid_out' in dir() else sid
 
     except Exception as e:
         print(f"[/추가 오류] {e}")
         return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
 
-    # embed용 player 재조회 (기존 유저 경로)
     if player is None:
         players = await get_steam_users_info([sid_out])
         player = players[0] if players else None
@@ -826,19 +763,59 @@ async def delete_user(i: discord.Interaction, target: str):
             if monitored == 0:
                 return await i.followup.send("❌ 이미 감시 해제 상태")
 
-            cursor.execute(
-                "UPDATE users SET is_monitored = 0 WHERE steam_id = ?",
-                (sid,)
-            )
+            cursor.execute("UPDATE users SET is_monitored = 0 WHERE steam_id = ?", (sid,))
 
     except Exception as e:
         print(f"[/삭제 오류] {e}")
         return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
 
     await i.followup.send(
-        f"✅ 감시 해제 완료\n\n"
-        f"등록 별명: {name_key}\n"
-        f"최근 닉네임: {current_name}\n"
+        f"✅ 감시 해제 완료\n\n등록 별명: {name_key}\n최근 닉네임: {current_name}\nSteamID: {sid}"
+    )
+
+# =========================
+# /별명수정
+# =========================
+
+@bot.tree.command(name="별명수정", description="등록된 유저의 별명을 변경합니다")
+async def rename_user(i: discord.Interaction, target: str, 새별명: str):
+    if not await check_admin_channel(i):
+        return
+
+    await i.response.defer()
+
+    새별명 = 새별명.strip()
+
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+
+            # 새 별명 중복 체크
+            cursor.execute("SELECT steam_id FROM users WHERE name_key = ?", (새별명,))
+            dup = cursor.fetchone()
+            if dup:
+                return await i.followup.send(f"❌ 이미 사용 중인 별명입니다: `{새별명}`")
+
+            row = find_user(cursor, target)
+            if not row:
+                return await i.followup.send("❌ 유저를 찾을 수 없습니다")
+
+            sid, current_name, old_name_key, is_monitored = row
+
+            cursor.execute(
+                "UPDATE users SET name_key = ? WHERE steam_id = ?",
+                (새별명, sid)
+            )
+
+    except Exception as e:
+        print(f"[/별명수정 오류] {e}")
+        return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
+
+    await i.followup.send(
+        f"✅ 별명 수정 완료\n\n"
+        f"이전 별명: `{old_name_key}`\n"
+        f"새 별명: `{새별명}`\n"
+        f"현재 닉네임: {current_name}\n"
         f"SteamID: {sid}"
     )
 
@@ -869,7 +846,6 @@ async def user_history(i: discord.Interaction, target: str):
                 """, (target,))
 
             row = cursor.fetchone()
-
             if not row:
                 return await i.followup.send("❌ 유저 없음")
 
@@ -923,7 +899,6 @@ async def status_list(i: discord.Interaction):
 
     for name, sid, current_name in rows:
         line = f"{name} / {current_name or '없음'} / {sid}\n"
-
         if len(current_msg + line + "```") > 1900:
             current_msg += "```"
             messages.append(current_msg)
@@ -939,7 +914,6 @@ async def status_list(i: discord.Interaction):
             await i.followup.send(msg)
         except Exception as e:
             print(f"[현황 전송 오류] {e}")
-
 
 # =========================
 # /전체현황
@@ -993,21 +967,31 @@ async def full_status(i: discord.Interaction):
 
     await i.followup.send(embed=embed)
 
-
 # =========================
-# /채널설정
+# /채널설정 (서버당 관리/알림 2개씩)
 # =========================
 
 _ROLE_TO_COLUMN = {
-    "admin":  "admin_id",
-    "notify": "notify_id"
+    "admin":   "admin_id",
+    "admin2":  "admin_id2",
+    "notify":  "notify_id",
+    "notify2": "notify_id2",
 }
 
-@bot.tree.command(name="채널설정", description="관리/알림 채널 설정")
+_ROLE_LABEL = {
+    "admin":   "관리채널 1",
+    "admin2":  "관리채널 2",
+    "notify":  "알림채널 1",
+    "notify2": "알림채널 2",
+}
+
+@bot.tree.command(name="채널설정", description="관리/알림 채널 설정 (각 2개까지)")
 @app_commands.choices(
     역할=[
-        app_commands.Choice(name="관리", value="admin"),
-        app_commands.Choice(name="알림", value="notify")
+        app_commands.Choice(name="관리채널 1", value="admin"),
+        app_commands.Choice(name="관리채널 2", value="admin2"),
+        app_commands.Choice(name="알림채널 1", value="notify"),
+        app_commands.Choice(name="알림채널 2", value="notify2"),
     ]
 )
 async def set_channel(i: discord.Interaction, 역할: str):
@@ -1034,11 +1018,8 @@ async def set_channel(i: discord.Interaction, 역할: str):
         print(f"[/채널설정 오류] {e}")
         return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
 
-    await i.followup.send(f"✅ {역할} 채널 설정 완료")
-
-# =========================
-# 실행
-# =========================
+    label = _ROLE_LABEL.get(역할, 역할)
+    await i.followup.send(f"✅ {label} 설정 완료: <#{i.channel_id}>")
 
 # =========================
 # /동기화
@@ -1051,15 +1032,12 @@ async def sync_sav(i: discord.Interaction):
     if not await check_admin_channel(i):
         return
 
-    # 파일 첨부 안내 메시지 전송
     await i.response.send_message(
         "📂 **seenplayers.sav 파일을 첨부해서 보내주세요.**\n"
-        "여러 파일을 한 번에 올려도 됩니다. (예: Uuvana1~3, UuvanaHARDCORE)\n"
-        "⏳ 60초 안에 업로드해주세요.",
+        "여러 파일을 한 번에 올려도 됩니다.\n⏳ 60초 안에 업로드해주세요.",
         ephemeral=False
     )
 
-    # 파일 업로드 대기
     def check(m: discord.Message):
         return (
             m.channel.id == i.channel_id
@@ -1075,12 +1053,8 @@ async def sync_sav(i: discord.Interaction):
 
     sav_attachments = [a for a in msg.attachments if a.filename.endswith(".sav")]
 
-    await i.followup.send(
-        f"⚙️ {len(sav_attachments)}개 파일 처리 중... (Steam ID 추출 → DB 등록)\n"
-        f"유저 수에 따라 시간이 걸릴 수 있어요."
-    )
+    await i.followup.send(f"⚙️ {len(sav_attachments)}개 파일 처리 중...")
 
-    # 파일별 Steam ID 수집
     session = await get_http_session()
     found_ids: set[str] = set()
 
@@ -1092,14 +1066,12 @@ async def sync_sav(i: discord.Interaction):
                     parsed = parse_sav_file(file_bytes)
                     for item in parsed:
                         found_ids.add(item["steam_id"])
-                    print(f"[동기화] {attachment.filename}: {len(parsed)}개 ID 추출")
         except Exception as e:
             print(f"[동기화 파일 오류] {attachment.filename}: {e}")
 
     if not found_ids:
         return await i.followup.send("❌ .sav 파일에서 Steam ID를 찾을 수 없었어요.")
 
-    # DB에 없는 신규 ID 필터링
     with db_connection(auto_commit=False) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT steam_id FROM users")
@@ -1110,22 +1082,15 @@ async def sync_sav(i: discord.Interaction):
 
     if not truly_new:
         return await i.followup.send(
-            f"✅ 동기화 완료!\n"
-            f"📊 .sav 총 Steam ID: {len(found_ids):,}개\n"
-            f"🔁 이미 DB에 있는 유저: {already_count:,}명\n"
-            f"🆕 신규 등록: 0명 (모두 이미 등록됨)"
+            f"✅ 동기화 완료!\n📊 .sav 총 Steam ID: {len(found_ids):,}개\n"
+            f"🔁 이미 DB에 있는 유저: {already_count:,}명\n🆕 신규 등록: 0명"
         )
 
-    await i.followup.send(
-        f"🔍 신규 유저 {len(truly_new):,}명 발견! Steam 닉네임 조회 중...\n"
-        f"(100명당 약 1~2초 소요, 총 예상 시간: 약 {max(1, len(truly_new) // 100 * 2)}초)"
-    )
+    await i.followup.send(f"🔍 신규 유저 {len(truly_new):,}명 발견! 닉네임 조회 중...")
 
-    # Steam API로 닉네임 일괄 조회
     players = await get_steam_users_info(truly_new)
     p_dict = {p["steamid"]: p for p in players}
 
-    # DB 등록
     registered = 0
     failed_nick = 0
 
@@ -1157,20 +1122,14 @@ async def sync_sav(i: discord.Interaction):
             except Exception as e:
                 print(f"[동기화 등록 오류] {sid}: {e}")
 
-    # 최종 결과 리포트
-    embed = discord.Embed(
-        title="✅ .sav 동기화 완료",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="✅ .sav 동기화 완료", color=discord.Color.green())
     embed.add_field(name="📂 처리한 파일 수", value=f"{len(sav_attachments)}개", inline=True)
     embed.add_field(name="👥 .sav 총 Steam ID", value=f"{len(found_ids):,}개", inline=True)
     embed.add_field(name="🔁 이미 등록된 유저", value=f"{already_count:,}명", inline=True)
     embed.add_field(name="🆕 신규 등록 완료", value=f"{registered:,}명", inline=True)
     embed.add_field(name="⚠️ 닉네임 조회 실패", value=f"{failed_nick:,}명 (ID는 등록됨)", inline=True)
-    embed.set_footer(text="신규 등록된 유저는 is_monitored=0 (알림 비활성) 상태입니다. /추가로 감시 활성화하세요.")
-
+    embed.set_footer(text="신규 등록된 유저는 is_monitored=0 상태입니다. /추가로 감시 활성화하세요.")
     await i.followup.send(embed=embed)
-
 
 # =========================
 # /도움말
@@ -1178,49 +1137,42 @@ async def sync_sav(i: discord.Interaction):
 
 @bot.tree.command(name="도움말", description="봇 명령어 안내")
 async def help_command(i: discord.Interaction):
-    embed = discord.Embed(
-        title="📖 롱빈터 스팀 트래커 봇 도움말",
-        color=discord.Color.blurple()
-    )
+    embed = discord.Embed(title="📖 롱빈터 스팀 트래커 봇 도움말", color=discord.Color.blurple())
 
     embed.add_field(
         name="👤 유저 관리",
         value=(
-            "`/추가 [SteamID] (별명)` — 유저를 감시 목록에 등록, 닉변 알림 활성화\n"
-            "`/삭제 [SteamID 또는 별명]` — 감시 해제 (DB에서 삭제되진 않음)\n"
+            "`/추가 [SteamID] (별명)` — 감시 목록 등록 및 닉변 알림 활성화\n"
+            "`/삭제 [SteamID 또는 별명]` — 감시 해제\n"
+            "`/별명수정 [SteamID 또는 별명] [새별명]` — 등록된 별명 변경\n"
             "`/내역 [SteamID 또는 별명]` — 닉네임 변경 내역 확인"
         ),
         inline=False
     )
-
     embed.add_field(
         name="📊 현황 확인",
         value=(
-            "`/현황` — 현재 알림 감시 중인 유저 목록\n"
-            "`/전체현황` — DB에 저장된 전체 유저 수 및 통계 (닉변 TOP 5 등)"
+            "`/현황` — 알림 감시 중인 유저 목록\n"
+            "`/전체현황` — 전체 유저 수 및 통계"
         ),
         inline=False
     )
-
     embed.add_field(
         name="🔄 동기화",
         value=(
-            "`/동기화` — .sav 파일을 업로드하면 Steam ID를 DB에 일괄 등록\n"
-            "　　　　　등록된 유저는 알림 비활성(is_monitored=0) 상태\n"
-            "　　　　　알림을 받으려면 `/추가`로 감시 활성화 필요"
+            "`/동기화` — .sav 파일 업로드로 Steam ID 일괄 등록\n"
+            "　　　　　등록된 유저는 알림 비활성 상태"
         ),
         inline=False
     )
-
     embed.add_field(
         name="⚙️ 설정",
         value=(
-            "`/채널설정 [관리/알림]` — 명령어를 사용할 관리 채널 / 닉변 알림을 받을 채널 설정\n"
+            "`/채널설정 [관리채널1/2 또는 알림채널1/2]` — 채널 설정 (각 2개까지)\n"
             "　　　　　　　관리자 권한 필요"
         ),
         inline=False
     )
-
     embed.add_field(
         name="ℹ️ 참고",
         value=(
@@ -1230,9 +1182,7 @@ async def help_command(i: discord.Interaction):
         ),
         inline=False
     )
-
     await i.response.send_message(embed=embed)
-
 
 # =========================
 # /일괄감시
@@ -1288,9 +1238,7 @@ async def bulk_monitor(i: discord.Interaction):
             not_found = 0
 
             for sid in _MONITORED_IDS:
-                cursor.execute(
-                    "UPDATE users SET is_monitored = 1 WHERE steam_id = ?", (sid,)
-                )
+                cursor.execute("UPDATE users SET is_monitored = 1 WHERE steam_id = ?", (sid,))
                 if cursor.rowcount > 0:
                     updated += 1
                 else:
@@ -1306,10 +1254,8 @@ async def bulk_monitor(i: discord.Interaction):
     embed.set_footer(text="이 명령어는 1회용입니다. 완료 후 코드에서 제거하세요.")
     await i.followup.send(embed=embed)
 
-
-
 # =========================
-# HTTP API 서버 (로컬 클라이언트용)
+# HTTP API 서버
 # =========================
 
 api = FastAPI()
@@ -1319,7 +1265,6 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 ALLOWED_GUILD_IDS     = set(os.getenv("ALLOWED_GUILD_IDS", "").split(","))
 REDIRECT_URI          = "http://localhost:7777/callback"
 
-# 세션 토큰 저장소 {session_token: discord_user_id}
 _sessions: dict = {}
 
 
@@ -1328,7 +1273,6 @@ def _make_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-# ── OAuth2 로그인 URL 반환 ──
 @api.get("/auth/login")
 async def auth_login():
     import urllib.parse
@@ -1341,12 +1285,10 @@ async def auth_login():
     return JSONResponse(content={"url": f"https://discord.com/oauth2/authorize?{params}"})
 
 
-# ── OAuth2 콜백 (로컬 서버가 받아서 봇 서버로 전달) ──
 @api.get("/auth/callback")
 async def auth_callback(code: str):
     session = await get_http_session()
 
-    # 액세스 토큰 교환
     try:
         async with session.post(
             "https://discord.com/api/oauth2/token",
@@ -1367,7 +1309,6 @@ async def auth_callback(code: str):
     if not access_token:
         return JSONResponse(status_code=401, content={"error": "토큰 발급 실패"})
 
-    # 유저 정보 조회
     try:
         async with session.get(
             "https://discord.com/api/users/@me",
@@ -1383,29 +1324,22 @@ async def auth_callback(code: str):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    # 허용 서버 멤버 확인
     user_guild_ids = {str(g["id"]) for g in guilds_data}
     if not (user_guild_ids & ALLOWED_GUILD_IDS):
         return JSONResponse(status_code=403, content={"error": "허용된 서버 멤버가 아닙니다"})
 
-    # 세션 발급
     session_token = _make_session_token()
     _sessions[session_token] = user_data.get("id")
     username = user_data.get("username", "unknown")
     print(f"[인증 성공] {username} ({user_data.get('id')})")
 
-    return JSONResponse(content={
-        "session_token": session_token,
-        "username": username,
-    })
+    return JSONResponse(content={"session_token": session_token, "username": username})
 
 
-# ── 세션 검증 ──
 def _verify_session(session_token: str) -> bool:
     return session_token in _sessions
 
 
-# ── 세션 검증 엔드포인트 ──
 @api.get("/auth/verify")
 async def auth_verify(session_token: str = ""):
     if _verify_session(session_token):
@@ -1413,14 +1347,12 @@ async def auth_verify(session_token: str = ""):
     return JSONResponse(status_code=401, content={"valid": False})
 
 
-# ── 유저 조회 ──
 @api.get("/user")
 async def get_user(steam_id: str, session_token: str = ""):
     if not _verify_session(session_token):
         return JSONResponse(status_code=401, content={"error": "인증이 필요합니다"})
 
     try:
-        # API는 읽기 전용 별도 연결 사용 (DB 락 방지)
         conn = sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
@@ -1465,7 +1397,7 @@ async def run_api():
         log_level="info",
     )
     server = uvicorn.Server(config)
-    server.install_signal_handlers = lambda: None  # Railway 시그널 충돌 방지
+    server.install_signal_handlers = lambda: None
     await server.serve()
 
 
