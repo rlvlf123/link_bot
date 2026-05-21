@@ -336,7 +336,7 @@ def create_status_embed(
     history: list[str],
     mode: str = "notify",
     player: dict | None = None
-) -> discord.Embed:
+) -> tuple[discord.Embed, discord.ui.View]:
 
     colors = {
         "add":     discord.Color.green(),
@@ -376,12 +376,21 @@ def create_status_embed(
         inline=False
     )
     embed.add_field(
-        name="Steam 프로필",
-        value=f"https://steamcommunity.com/profiles/{sid}",
+        name="Steam ID",
+        value=f"`{sid}`",
         inline=False
     )
 
-    return embed
+    # 프로필 바로가기 버튼
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(
+        label="Steam 프로필 바로가기",
+        url=f"https://steamcommunity.com/profiles/{sid}",
+        style=discord.ButtonStyle.link,
+        emoji="🔗"
+    ))
+
+    return embed, view
 
 # =========================
 # SAV 스캔
@@ -566,7 +575,7 @@ class MyBot(commands.Bot):
                         if row[1]: notify_channels.append(row[1])
 
                 for name_key, sid, history, player in pending_notify:
-                    embed = create_status_embed(name_key, sid, history, "notify", player)
+                    embed, view = create_status_embed(name_key, sid, history, "notify", player)
 
                     for ch_id in notify_channels:
                         try:
@@ -574,7 +583,7 @@ class MyBot(commands.Bot):
                             if not ch:
                                 ch = await self.fetch_channel(ch_id)
                             if ch:
-                                await ch.send(embed=embed)
+                                await ch.send(embed=embed, view=view)
                         except Exception as e:
                             print(f"[알림 오류] ch={ch_id} {e}")
 
@@ -721,9 +730,9 @@ async def add_user(i: discord.Interaction, target: str, 별명: str = None):
         players = await get_steam_users_info([sid_out])
         player = players[0] if players else None
 
-    embed = create_status_embed(name_key_out, sid_out, history, "add", player)
+    embed, view = create_status_embed(name_key_out, sid_out, history, "add", player)
     embed.add_field(name="감시 상태", value="🔔 알림 활성화", inline=False)
-    await i.followup.send(embed=embed)
+    await i.followup.send(embed=embed, view=view)
 
 # =========================
 # /삭제
@@ -847,12 +856,12 @@ async def user_history(i: discord.Interaction, target: str):
     players = await get_steam_users_info([sid])
     player = players[0] if players else None
 
-    embed = create_status_embed(name_key, sid, history, "history", player)
+    embed, view = create_status_embed(name_key, sid, history, "history", player)
     embed.add_field(name="감시 상태", value="🔔 감시중" if monitored else "🔇 미감시", inline=False)
     embed.add_field(name="최근 갱신", value=updated_at or "없음", inline=False)
     embed.add_field(name="닉변 횟수", value=str(max(0, len(history) - 1)), inline=False)
 
-    await i.followup.send(embed=embed)
+    await i.followup.send(embed=embed, view=view)
 
 # =========================
 # /현황
@@ -983,6 +992,7 @@ _ROLE_LABEL = {
     ]
 )
 async def set_channel(i: discord.Interaction, 역할: str):
+    import time
     if not i.user.guild_permissions.administrator:
         return await i.response.send_message("❌ 관리자 권한 필요", ephemeral=True)
 
@@ -992,8 +1002,9 @@ async def set_channel(i: discord.Interaction, 역할: str):
     if col is None:
         return await i.followup.send("❌ 올바르지 않은 역할입니다")
 
-    try:
-        with db_connection() as conn:
+    for attempt in range(10):
+        try:
+            conn = get_db()
             cursor = conn.cursor()
             cursor.execute(f"""
                 INSERT INTO channels (guild_id, {col})
@@ -1001,10 +1012,22 @@ async def set_channel(i: discord.Interaction, 역할: str):
                 ON CONFLICT(guild_id)
                 DO UPDATE SET {col}=excluded.{col}
             """, (str(i.guild_id), i.channel_id))
-
-    except Exception as e:
-        print(f"[/채널설정 오류] {e}")
-        return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
+            conn.commit()
+            conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            try: conn.close()
+            except: pass
+            if "database is locked" in str(e) and attempt < 9:
+                time.sleep(1)
+                continue
+            print(f"[/채널설정 오류] {e}")
+            return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
+        except Exception as e:
+            try: conn.close()
+            except: pass
+            print(f"[/채널설정 오류] {e}")
+            return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
 
     label = _ROLE_LABEL.get(역할, 역할)
     await i.followup.send(f"✅ {label} 설정 완료: <#{i.channel_id}>")
