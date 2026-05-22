@@ -740,6 +740,7 @@ async def add_user(i: discord.Interaction, target: str, 별명: str = None):
 
 @bot.tree.command(name="삭제", description="알림 감시 해제")
 async def delete_user(i: discord.Interaction, target: str):
+    import time
     if not await check_admin_permission(i):
         return
     if not await check_admin_channel(i):
@@ -747,24 +748,41 @@ async def delete_user(i: discord.Interaction, target: str):
 
     await i.response.defer()
 
-    try:
-        with db_connection() as conn:
+    sid = current_name = name_key = None
+
+    for attempt in range(10):
+        try:
+            conn = get_db()
             cursor = conn.cursor()
             row = find_user(cursor, target)
 
             if not row:
+                conn.close()
                 return await i.followup.send("❌ 유저 없음")
 
             sid, current_name, name_key, monitored = row
 
             if monitored == 0:
+                conn.close()
                 return await i.followup.send("❌ 이미 감시 해제 상태")
 
             cursor.execute("UPDATE users SET is_monitored = 0 WHERE steam_id = ?", (sid,))
-
-    except Exception as e:
-        print(f"[/삭제 오류] {e}")
-        return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
+            conn.commit()
+            conn.close()
+            break
+        except sqlite3.OperationalError as e:
+            try: conn.close()
+            except: pass
+            if "database is locked" in str(e) and attempt < 9:
+                time.sleep(1)
+                continue
+            print(f"[/삭제 오류] {e}")
+            return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
+        except Exception as e:
+            try: conn.close()
+            except: pass
+            print(f"[/삭제 오류] {e}")
+            return await i.followup.send("❌ 처리 중 오류가 발생했습니다")
 
     await i.followup.send(
         f"✅ 감시 해제 완료\n\n등록 별명: {name_key}\n최근 닉네임: {current_name}\nSteamID: {sid}"
