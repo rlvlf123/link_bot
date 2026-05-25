@@ -194,6 +194,27 @@ def init_db():
                 (sid,)
             )
 
+        # HTML 엔티티 → 실제 문자 변환 (기존 데이터 정리)
+        import html as html_module
+
+        # users.current_name 정리
+        cursor.execute("SELECT steam_id, current_name FROM users WHERE current_name LIKE '%&%'")
+        for sid, name in cursor.fetchall():
+            if name:
+                decoded = html_module.unescape(name)
+                if decoded != name:
+                    cursor.execute("UPDATE users SET current_name = ? WHERE steam_id = ?", (decoded, sid))
+
+        # nickname_history 정리
+        cursor.execute("SELECT id, nickname FROM nickname_history WHERE nickname LIKE '%&%'")
+        for nid, nick in cursor.fetchall():
+            if nick:
+                decoded = html_module.unescape(nick)
+                if decoded != nick:
+                    cursor.execute("UPDATE nickname_history SET nickname = ? WHERE id = ?", (decoded, nid))
+
+        print("[DB] HTML 엔티티 정리 완료")
+
 
 init_db()
 
@@ -255,6 +276,11 @@ async def get_steam_users_info(steam_ids: list[str]) -> list[dict]:
     return all_players
 
 
+def decode_html_entities(text: str) -> str:
+    import html
+    return html.unescape(text)
+
+
 async def get_nickname_from_xml(steam_id: str) -> str | None:
     url = f"https://steamcommunity.com/profiles/{steam_id}/?xml=1"
     session = await get_http_session()
@@ -265,7 +291,7 @@ async def get_nickname_from_xml(steam_id: str) -> str | None:
                 root = ET.fromstring(content)
                 node = root.find("steamID")
                 if node is not None and node.text:
-                    return node.text.strip()
+                    return decode_html_entities(node.text.strip())
     except Exception:
         pass
     return None
@@ -275,7 +301,7 @@ async def get_current_nickname(sid: str, player: dict | None = None) -> str | No
     if player:
         name = player.get("personaname", "").strip()
         if name:
-            return name
+            return decode_html_entities(name)
     return await get_nickname_from_xml(sid)
 
 # =========================
