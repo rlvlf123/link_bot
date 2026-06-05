@@ -137,7 +137,6 @@ def init_db():
         ensure_column(cursor, "users", "is_monitored", "INTEGER DEFAULT 0")
         ensure_column(cursor, "users", "updated_at", "TEXT")
 
-        # channels - 서버당 관리/알림 채널 2개씩
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS channels (
                 guild_id TEXT PRIMARY KEY,
@@ -194,10 +193,8 @@ def init_db():
                 (sid,)
             )
 
-        # HTML 엔티티 → 실제 문자 변환 (기존 데이터 정리)
         import html as html_module
 
-        # users.current_name 정리
         cursor.execute("SELECT steam_id, current_name FROM users WHERE current_name LIKE '%&%'")
         for sid, name in cursor.fetchall():
             if name:
@@ -205,7 +202,6 @@ def init_db():
                 if decoded != name:
                     cursor.execute("UPDATE users SET current_name = ? WHERE steam_id = ?", (decoded, sid))
 
-        # nickname_history 정리
         cursor.execute("SELECT id, nickname FROM nickname_history WHERE nickname LIKE '%&%'")
         for nid, nick in cursor.fetchall():
             if nick:
@@ -309,6 +305,7 @@ async def get_current_nickname(sid: str, player: dict | None = None) -> str | No
 # =========================
 
 _SAV_STEAM_ID_PATTERN = re.compile(rb"7656119\d{10}")
+_SAV_EOS_PATTERN = re.compile(rb"([a-f0-9]{32})")
 
 
 def parse_sav_file(file_bytes: bytes) -> list[dict]:
@@ -321,6 +318,20 @@ def parse_sav_file(file_bytes: bytes) -> list[dict]:
     except Exception as e:
         print(f"[SAV 파싱 오류] {e}")
         return []
+
+
+def parse_sav_with_eos(file_bytes: bytes) -> dict[str, str]:
+    """EOS ID → Steam ID 매핑 반환"""
+    try:
+        mapping = {}
+        content = file_bytes.decode('latin-1', errors='ignore')
+        found = re.findall(r'([a-f0-9]{32}).*?(7656119\d{10})', content, re.DOTALL)
+        for eos, sid in found:
+            mapping[sid.strip()] = eos
+        return mapping
+    except Exception as e:
+        print(f"[SAV EOS 파싱 오류] {e}")
+        return {}
 
 # =========================
 # 닉네임 히스토리
@@ -407,7 +418,6 @@ def create_status_embed(
         inline=False
     )
 
-    # 프로필 바로가기 버튼
     view = discord.ui.View()
     view.add_item(discord.ui.Button(
         label="Steam 프로필 바로가기",
@@ -591,7 +601,6 @@ class MyBot(commands.Bot):
                 if not pending_notify:
                     return
 
-                # 알림 채널 조회 (notify_id + notify_id2)
                 with db_connection(auto_commit=False) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT notify_id, notify_id2 FROM channels")
@@ -831,7 +840,6 @@ async def rename_user(i: discord.Interaction, target: str, 새별명: str):
         with db_connection() as conn:
             cursor = conn.cursor()
 
-            # 새 별명 중복 체크
             cursor.execute("SELECT steam_id FROM users WHERE name_key = ?", (새별명,))
             dup = cursor.fetchone()
             if dup:
@@ -1009,7 +1017,7 @@ async def full_status(i: discord.Interaction):
     await i.followup.send(embed=embed)
 
 # =========================
-# /채널설정 (서버당 관리/알림 2개씩)
+# /채널설정
 # =========================
 
 _ROLE_TO_COLUMN = {
@@ -1107,11 +1115,11 @@ async def sync_sav(i: discord.Interaction):
         return await i.followup.send("⏰ 시간 초과. `/동기화`를 다시 실행해주세요.", ephemeral=True)
 
     sav_attachments = [a for a in msg.attachments if a.filename.endswith(".sav")]
-
     await i.followup.send(f"⚙️ {len(sav_attachments)}개 파일 처리 중...")
 
     session = await get_http_session()
     found_ids: set[str] = set()
+    eos_mapping: dict[str, str] = {}  # steam_id → eos_id
 
     for attachment in sav_attachments:
         try:
@@ -1121,6 +1129,8 @@ async def sync_sav(i: discord.Interaction):
                     parsed = parse_sav_file(file_bytes)
                     for item in parsed:
                         found_ids.add(item["steam_id"])
+                    # EOS ID 매핑도 추출
+                    eos_mapping.update(parse_sav_with_eos(file_bytes))
         except Exception as e:
             print(f"[동기화 파일 오류] {attachment.filename}: {e}")
 
@@ -1162,12 +1172,13 @@ async def sync_sav(i: discord.Interaction):
 
                 base_key = f"user_{sid[-6:]}"
                 name_key = unique_name_key(cursor, base_key)
+                eos_id = eos_mapping.get(sid, "")
 
                 cursor.execute("""
                     INSERT OR IGNORE INTO users
-                        (steam_id, name_key, current_name, is_monitored, updated_at)
-                    VALUES (?, ?, ?, 0, ?)
-                """, (sid, name_key, current_name, datetime.now().isoformat()))
+                        (steam_id, name_key, current_name, is_monitored, updated_at, eos_id)
+                    VALUES (?, ?, ?, 0, ?, ?)
+                """, (sid, name_key, current_name, datetime.now().isoformat(), eos_id))
 
                 if current_name:
                     add_history_if_needed(cursor, sid, current_name)
@@ -1414,7 +1425,7 @@ async def get_user(steam_id: str, session_token: str = ""):
         cursor = conn.cursor()
 
         cursor.execute("""
-            SELECT steam_id, name_key, current_name, is_monitored
+            SELECT steam_id, name_key, current_name, is_monitored, eos_id
             FROM users WHERE steam_id = ?
         """, (steam_id,))
         row = cursor.fetchone()
@@ -1437,6 +1448,7 @@ async def get_user(steam_id: str, session_token: str = ""):
             "name_key": row["name_key"],
             "current_name": row["current_name"],
             "is_monitored": bool(row["is_monitored"]),
+            "eos_id": row["eos_id"] if row["eos_id"] else "",
             "history": history
         })
 
